@@ -89,6 +89,9 @@ class InferenceTask(SQLModel, table=True):
     transcript: Optional[str] = None
     error: Optional[str] = Field(default=None, max_length=500)
     wall_ms: Optional[int] = None
+    progress_pct: Optional[float] = None
+    phase: Optional[str] = None
+    log_text: Optional[str] = Field(default=None, max_length=20000)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

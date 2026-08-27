@@ -209,6 +209,38 @@ async def cancel_job(session: AsyncSession, job: ModelDownloadJob) -> ModelDownl
     return job
 
 
+async def delete_deployment(
+    session: AsyncSession, machine_id: str, nim_id: str
+) -> dict:
+    machine = await session.get(Machine, machine_id)
+    if not machine:
+        return {"ok": False, "error": "machine not found"}
+
+    root = await resolve_root(session, machine)
+    remote_dir = target_dir_for(root, nim_id)
+
+    if machine.status == "online":
+        try:
+            conn = await POOL.get(machine.host, machine.port, machine.username)
+            exec_dir = remote_dir.replace("~", "$HOME", 1) if remote_dir.startswith("~") else remote_dir
+            await run_cmd(conn, f'rm -rf "{exec_dir}"', timeout=60)
+        except Exception as exc:
+            log.warning("remote delete failed for %s on %s: %s", nim_id, machine.name, exc)
+            return {"ok": False, "error": f"SSH delete failed: {exc}"}
+
+    result = await session.exec(
+        select(ModelDownloadJob).where(
+            ModelDownloadJob.machine_id == machine_id,
+            ModelDownloadJob.nim_id == nim_id,
+        )
+    )
+    for job in result.all():
+        job.status = "deleted"
+        session.add(job)
+    await session.commit()
+    return {"ok": True, "target_dir": display_dir(remote_dir)}
+
+
 INSTALL_HF_SCRIPT = (
     'export PATH="$HOME/.local/bin:$PATH"; '
     'if command -v hf >/dev/null || command -v huggingface-cli >/dev/null; then '

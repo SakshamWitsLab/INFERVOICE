@@ -26,6 +26,9 @@ async def init_db() -> None:
             "ALTER TABLE modeldownloadjob ADD COLUMN phase VARCHAR",
             "ALTER TABLE modeldownloadjob ADD COLUMN files_done INTEGER",
             "ALTER TABLE modeldownloadjob ADD COLUMN files_total INTEGER",
+            "ALTER TABLE inferencetask ADD COLUMN progress_pct FLOAT",
+            "ALTER TABLE inferencetask ADD COLUMN phase VARCHAR",
+            "ALTER TABLE inferencetask ADD COLUMN log_text VARCHAR",
         ):
             try:
                 await conn.execute(text(stmt))

@@ -11,6 +11,7 @@ from ..db import get_session, get_setting, set_setting
 from ..downloads import (
     SETTING_MODELS_ROOT,
     cancel_job,
+    delete_deployment,
     install_hf_cli,
     refresh_job_status,
     start_download,
@@ -51,6 +52,10 @@ class JobOut(BaseModel):
     error: str | None
     remote_pid: int | None
     log_tail: str | None = None
+    progress_pct: float | None = None
+    phase: str | None = None
+    files_done: int | None = None
+    files_total: int | None = None
     created_at: str
 
 
@@ -66,6 +71,10 @@ def _job_out(job: ModelDownloadJob, log_tail: str | None = None) -> JobOut:
         error=job.error,
         remote_pid=job.remote_pid,
         log_tail=log_tail,
+        progress_pct=job.progress_pct,
+        phase=job.phase,
+        files_done=job.files_done,
+        files_total=job.files_total,
         created_at=job.created_at.isoformat(),
     )
 
@@ -134,7 +143,7 @@ async def create_download(body: DownloadIn, session: AsyncSession = Depends(get_
 @router.get("/downloads", response_model=list[JobOut])
 async def list_downloads(session: AsyncSession = Depends(get_session)):
     result = await session.exec(select(ModelDownloadJob).order_by(ModelDownloadJob.created_at.desc()))
-    jobs = list(result.all())
+    jobs = [j for j in result.all() if j.status != "deleted"]
     refreshed = []
     for job in jobs:
         await refresh_job_status(session, job)
@@ -170,6 +179,22 @@ async def cancel(job_id: str, session: AsyncSession = Depends(get_session)):
     await cancel_job(session, job)
     await session.commit()
     return _job_out(job)
+
+
+@router.delete("/deployments/{machine_id}/{nim_id:path}")
+async def remove_deployment(
+    machine_id: str, nim_id: str, session: AsyncSession = Depends(get_session)
+):
+    machine = await session.get(Machine, machine_id)
+    if not machine:
+        raise HTTPException(404, "machine not found")
+    try:
+        result = await delete_deployment(session, machine_id, nim_id)
+    except SSHError as exc:
+        raise HTTPException(502, detail=str(exc))
+    if not result["ok"]:
+        raise HTTPException(500, detail=result.get("error", "delete failed"))
+    return result
 
 
 @router.post("/machines/{machine_id}/install-hf-cli")

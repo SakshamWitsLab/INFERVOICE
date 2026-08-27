@@ -12,6 +12,7 @@ import {
   KeyRound,
   Loader2,
   Pencil,
+  Plus,
   Search,
   Server,
   Trash2,
@@ -62,6 +63,7 @@ export default function ModelsPage() {
       ) : (
         <>
           <PathConfigurator />
+          <DeploymentMatrix />
           <Catalog />
           <DownloadsPanel />
         </>
@@ -175,6 +177,118 @@ function KeySetup({ onSaved }: { onSaved: () => void }) {
           Validate & save key
         </button>
       </form>
+    </section>
+  );
+}
+
+function DeploymentMatrix() {
+  const { data: deploymentsRes, reload } = usePoll(() => api.deployments(true), 20000);
+  const { data: machines } = usePoll<Machine[]>(api.listMachines, 10000);
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [deployTarget, setDeployTarget] = useState<{ nimId: string; machineId: string } | null>(null);
+
+  const deployments = deploymentsRes?.deployments ?? [];
+  const onlineMachines = (machines ?? []).filter((m) => m.status === "online");
+
+  const matrix = useMemo(() => {
+    const map = new Map<string, Map<string, (typeof deployments)[0]>>();
+    for (const d of deployments) {
+      if (!map.has(d.nim_id)) map.set(d.nim_id, new Map());
+      map.get(d.nim_id)!.set(d.machine_id, d);
+    }
+    return map;
+  }, [deployments]);
+
+  const modelIds = useMemo(() => [...matrix.keys()].sort(), [matrix]);
+
+  if (onlineMachines.length === 0 || modelIds.length === 0) return null;
+
+  async function handleDelete(machineId: string, nimId: string) {
+    const key = `${machineId}:${nimId}`;
+    if (!window.confirm(`Remove this model from this machine?`)) return;
+    setDeleting(key);
+    try {
+      await api.deleteDeployment(machineId, nimId);
+      reload();
+    } catch {}
+    setDeleting(null);
+  }
+
+  return (
+    <section className="mt-6">
+      <h2 className="text-sm font-medium text-zinc-300">
+        Installed models <span className="text-zinc-600">({deployments.length})</span>
+      </h2>
+      <div className="mt-2 overflow-x-auto rounded-xl border border-white/10 bg-white/[0.02]">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b border-white/10">
+              <th className="px-3 py-2 text-left text-[10px] font-semibold uppercase tracking-wider text-zinc-500">
+                Model
+              </th>
+              {onlineMachines.map((m) => (
+                <th key={m.id} className="px-3 py-2 text-center">
+                  <span className="text-[10px] font-medium text-zinc-400">{m.name}</span>
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {modelIds.map((nimId, idx) => (
+              <tr key={nimId} className={idx % 2 ? "bg-white/[0.015]" : ""}>
+                <td className="whitespace-nowrap px-3 py-2 font-mono text-[11px] text-zinc-300">
+                  {nimId}
+                </td>
+                {onlineMachines.map((m) => {
+                  const dep = matrix.get(nimId)?.get(m.id);
+                  const key = `${m.id}:${nimId}`;
+                  const isDeleting = deleting === key;
+                  return (
+                    <td key={m.id} className="px-3 py-2 text-center">
+                      {dep ? (
+                        <span className="group inline-flex items-center gap-1">
+                          <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                          {dep.disk_size && (
+                            <span className="text-[9px] text-zinc-600">{dep.disk_size}</span>
+                          )}
+                          <button
+                            onClick={() => handleDelete(m.id, nimId)}
+                            disabled={isDeleting}
+                            className="ml-1 hidden rounded p-0.5 text-zinc-600 hover:bg-red-400/10 hover:text-red-400 group-hover:inline-block"
+                            title="Remove model from this machine"
+                          >
+                            {isDeleting ? (
+                              <Loader2 className="h-3 w-3 animate-spin" />
+                            ) : (
+                              <Trash2 className="h-3 w-3" />
+                            )}
+                          </button>
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => setDeployTarget({ nimId, machineId: m.id })}
+                          className="inline-flex h-5 w-5 items-center justify-center rounded text-zinc-700 transition-colors hover:bg-violet-400/10 hover:text-violet-400"
+                          title={`Deploy ${nimId} to ${m.name}`}
+                        >
+                          <Plus className="h-3 w-3" />
+                        </button>
+                      )}
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {deployTarget && (
+        <DeployDialog
+          model={{ nim_id: deployTarget.nimId } as NvidiaModelInfo}
+          initialMachineId={deployTarget.machineId}
+          onClose={() => setDeployTarget(null)}
+          onChanged={reload}
+        />
+      )}
     </section>
   );
 }
@@ -606,6 +720,17 @@ function elapsed(iso: string): string {
   return `${s}s`;
 }
 
+function eta(job: DownloadJob): string | null {
+  if (job.progress_pct == null || job.progress_pct <= 0) return null;
+  const elapsedMs = Date.now() - new Date(job.created_at).getTime();
+  const rate = job.progress_pct / elapsedMs;
+  if (rate <= 0) return null;
+  const remaining = (100 - job.progress_pct) / rate;
+  if (remaining > 3600000) return `~${Math.ceil(remaining / 3600000)}h left`;
+  if (remaining > 60000) return `~${Math.ceil(remaining / 60000)}m left`;
+  return `~${Math.ceil(remaining / 1000)}s left`;
+}
+
 function ActiveJobCard({ job, onCancel }: { job: DownloadJob; onCancel: () => void }) {
   const pct = job.progress_pct;
   return (
@@ -634,6 +759,7 @@ function ActiveJobCard({ job, onCancel }: { job: DownloadJob; onCancel: () => vo
           ) : (
             <span className="text-zinc-600">starting…</span>
           )}
+          {eta(job) && <span className="text-zinc-500">{eta(job)}</span>}
           <span className="text-zinc-600">{elapsed(job.created_at)}</span>
           <button
             onClick={onCancel}

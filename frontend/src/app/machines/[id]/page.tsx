@@ -16,6 +16,7 @@ import {
   Pencil,
   RefreshCw,
   Timer,
+  Trash2,
 } from "lucide-react";
 import { api, fmtGB, fmtUptime, relTime, type Deployment, type Machine } from "@/lib/api";
 import { usePoll } from "@/hooks/usePoll";
@@ -50,6 +51,7 @@ function Detail() {
   const [showKeyDialog, setShowKeyDialog] = useState(search.get("welcome") === "1");
   const [refreshing, setRefreshing] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [deletingModel, setDeletingModel] = useState<string | null>(null);
 
   const { data: m, reload } = usePoll<Machine>(
     () => api.getMachine(id!),
@@ -69,6 +71,16 @@ function Detail() {
       await reload();
     } catch {}
     setRefreshing(false);
+  }
+
+  async function deleteModel(nimId: string) {
+    if (!window.confirm(`Remove ${nimId} from ${m?.name}?`)) return;
+    setDeletingModel(nimId);
+    try {
+      await api.deleteDeployment(id!, nimId);
+      await reload();
+    } catch {}
+    setDeletingModel(null);
   }
 
   if (!m) {
@@ -216,7 +228,7 @@ function Detail() {
           </h2>
           <div className="space-y-2">
             {myModels.map((d) => (
-              <div key={`${d.nim_id}-${d.machine_id}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+              <div key={`${d.nim_id}-${d.machine_id}`} className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-white/5 px-3 py-2 text-xs hover:border-white/15">
                 <Link href="/models" className="font-medium text-violet-300 hover:text-violet-200">
                   {d.nim_id}
                 </Link>
@@ -226,6 +238,19 @@ function Detail() {
                     {d.disk_size} on disk
                   </span>
                 )}
+                <button
+                  onClick={() => deleteModel(d.nim_id)}
+                  disabled={deletingModel === d.nim_id}
+                  className="ml-auto inline-flex items-center gap-1 rounded-md border border-transparent px-2 py-1 text-[11px] text-zinc-500 transition-colors hover:border-red-400/30 hover:bg-red-400/10 hover:text-red-400"
+                  title={`Remove ${d.nim_id} from this machine`}
+                >
+                  {deletingModel === d.nim_id ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3 w-3" />
+                  )}
+                  delete
+                </button>
               </div>
             ))}
           </div>

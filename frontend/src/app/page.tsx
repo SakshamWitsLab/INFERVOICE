@@ -1,17 +1,25 @@
 "use client";
 
 import Link from "next/link";
-import { Plus, Server } from "lucide-react";
-import { api, type Machine } from "@/lib/api";
+import { Plus, Server, Mic, Trash2, Square } from "lucide-react";
+import { api, type Machine, type InferenceRunSummary } from "@/lib/api";
 import { usePoll } from "@/hooks/usePoll";
 import { MachineCard } from "@/components/MachineCard";
 
 export default function Dashboard() {
   const { data: machines, reload } = usePoll<Machine[]>(api.listMachines, 5000);
+  const { data: runsRes } = usePoll(() => api.listRuns(), 10000);
 
   const total = machines?.length ?? 0;
   const online = machines?.filter((m) => m.status === "online").length ?? 0;
   const issues = machines?.filter((m) => m.status === "auth_error").length ?? 0;
+
+  async function deleteRun(id: string) {
+    if (!window.confirm("Delete this run from history?")) return;
+    try {
+      await api.deleteRun(id);
+    } catch {}
+  }
 
   return (
     <main className="mx-auto max-w-6xl px-6 py-10">
@@ -56,11 +64,78 @@ export default function Dashboard() {
           </Link>
         </div>
       ) : (
-        <section className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {machines!.map((m) => (
-            <MachineCard key={m.id} machine={m} onChanged={reload} />
-          ))}
-        </section>
+        <>
+          <section className="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {machines!.map((m) => (
+              <MachineCard key={m.id} machine={m} onChanged={reload} />
+            ))}
+          </section>
+          <section className="mt-10">
+            <h2 className="mb-3 text-sm font-medium text-zinc-300">Recent inference runs</h2>
+            {(runsRes?.runs ?? []).length === 0 ? (
+              <p className="rounded-xl border border-dashed border-white/10 px-4 py-6 text-center text-xs text-zinc-600">
+                No runs yet.
+              </p>
+            ) : (
+              <div className="space-y-1.5">
+                {runsRes!.runs.map((r: InferenceRunSummary) => {
+                  const modelLabel =
+                    r.model_ids && r.model_ids.length > 1
+                      ? `multi (${r.model_ids.length} models)`
+                      : r.model_id;
+                  return (
+                    <div
+                      key={r.id}
+                      className={`flex items-stretch gap-0 rounded-lg border ${
+                        "border-white/10 hover:bg-white/5"
+                      }`}
+                    >
+                      <button
+                        onClick={() => {}}
+                        className="flex w-full flex-wrap items-center gap-3 px-3 py-2 text-left text-xs"
+                      >
+                        <Mic className="h-3 w-3 text-zinc-600" />
+                        <span className="font-medium">{modelLabel}</span>
+                        <span className="truncate text-zinc-500">{r.audio_name}</span>
+                        {r.status === "running" && (
+                          <span className="rounded-full border border-sky-400/30 bg-sky-400/10 px-2 py-0.5 text-[9px] text-sky-300">
+                            running
+                          </span>
+                        )}
+                        {r.status === "cancelled" && (
+                          <span className="rounded-full border border-zinc-500/30 bg-zinc-500/10 px-2 py-0.5 text-[9px] text-zinc-400">
+                            cancelled
+                          </span>
+                        )}
+                        <span className="ml-auto text-zinc-600">
+                          {r.done}/{r.machines.length} · {new Date(r.created_at).toLocaleTimeString()}
+                        </span>
+                      </button>
+                      <div className="flex items-center gap-1 border-l border-white/10 px-1.5">
+                        {r.status === "running" && (
+                          <button
+                            onClick={() => api.stopRun(r.id).catch(() => {})}
+                            title="Stop"
+                            className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-red-400/10 hover:text-red-400"
+                          >
+                            <Square className="h-3 w-3" />
+                          </button>
+                        )}
+                        <button
+                          onClick={() => deleteRun(r.id)}
+                          title="Delete"
+                          className="rounded-md p-1.5 text-zinc-500 transition-colors hover:bg-red-400/10 hover:text-red-400"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+        </>
       )}
     </main>
   );

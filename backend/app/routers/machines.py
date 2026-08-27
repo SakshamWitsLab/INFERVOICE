@@ -166,3 +166,38 @@ async def exec_command(machine_id: str, body: ExecIn, session: AsyncSession = De
     start = _time.monotonic()
     code, stdout, stderr = await run_cmd(conn, body.command)
     return ExecOut(exit_code=code, stdout=stdout, stderr=stderr, duration_ms=int((_time.monotonic() - start) * 1000))
+
+
+@router.post("/{machine_id}/diagnose")
+async def diagnose_machine(machine_id: str, session: AsyncSession = Depends(get_session)):
+    m = await _get_or_404(machine_id, session)
+    try:
+        conn = await POOL.get(m.host, m.port, m.username)
+    except SSHError as exc:
+        raise HTTPException(502, detail=str(exc))
+    script = (
+        'echo "arch=$(uname -m)"; '
+        'echo "os=$(sw_vers -productVersion 2>/dev/null)"; '
+        'echo "python3=$(command -v python3 || echo none)"; '
+        'echo "python3_ver=$(python3 --version 2>&1 || echo none)"; '
+        'echo "brew=$(command -v brew || echo none)"; '
+        'echo "uv=$(command -v uv || echo none)"; '
+        'echo "pyenv_base=$([ -d "$HOME/.pyenv/versions" ] && ls "$HOME/.pyenv/versions" || echo none)"; '
+        'echo "brew_py=$(ls /opt/homebrew/bin/python3.* 2>/dev/null | tr "\\n" " " || echo none)"; '
+        'echo "framework=$([ -d /Library/Frameworks/Python.framework/Versions ] && ls /Library/Frameworks/Python.framework/Versions | tr "\\n" " " || echo none)"; '
+        'echo "sudo=$(command -v sudo || echo none)"; '
+        'echo "sudo_nopasswd=$(sudo -n true 2>/dev/null && echo yes || echo no)"; '
+        'echo "iv_python=$([ -x "$HOME/.infervoice/uv-python" ] && echo present || echo absent)"; '
+        'echo "asr_runtime=$([ -x "$HOME/.infervoice/asr-venv/bin/parakeet-mlx" ] && echo present || echo absent)"'
+    )
+    try:
+        code, out, err = await run_cmd(conn, script)
+    except SSHError as exc:
+        raise HTTPException(502, detail=str(exc))
+    parsed: dict[str, str] = {}
+    for line in (out or "").splitlines():
+        key, _, val = line.partition("=")
+        if key:
+            parsed[key.strip()] = val.strip()
+    parsed["_exit_code"] = str(code)
+    return parsed

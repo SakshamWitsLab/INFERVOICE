@@ -119,10 +119,13 @@ export interface InferenceTask {
   machine_id: string;
   machine_name: string;
   nim_id: string;
-  status: "queued" | "uploading" | "inferring" | "done" | "failed";
+  status: "queued" | "uploading" | "downloading_model" | "inferring" | "installing_runtime" | "done" | "failed" | "cancelled";
   transcript: string | null;
   error: string | null;
   wall_ms: number | null;
+  progress_pct: number | null;
+  phase: string | null;
+  log_text: string | null;
 }
 
 export interface InferenceRunDetail {
@@ -140,6 +143,7 @@ export interface InferenceRunDetail {
 export interface InferenceRunSummary {
   id: string;
   model_id: string;
+  model_ids?: string[];
   audio_name: string;
   status: string;
   created_at: string;
@@ -202,8 +206,13 @@ export const api = {
     req<{ ok: boolean; output: string }>(`/api/nvidia/machines/${machineId}/install-hf-cli`, {
       method: "POST",
     }),
-  deployments: () =>
-    req<{ deployments: Deployment[] }>("/api/nvidia/deployments"),
+  deployments: (verify = false) =>
+    req<{ deployments: Deployment[] }>(`/api/nvidia/deployments${verify ? "?verify=true" : ""}`),
+  deleteDeployment: (machineId: string, nimId: string) =>
+    req<{ ok: boolean; target_dir: string }>(
+      `/api/nvidia/deployments/${machineId}/${encodeURIComponent(nimId)}`,
+      { method: "DELETE" }
+    ),
   modelsRoot: () => req<{ value: string | null }>("/api/nvidia/settings/models-root"),
   setModelsRoot: (path: string) =>
     req<{ ok: boolean; value: string }>("/api/nvidia/settings/models-root", {
@@ -231,8 +240,29 @@ export const api = {
         return res.json() as Promise<{ run_id: string }>;
       });
   },
+  createMultiRun: (
+    audio: File,
+    targets: { model_id: string; machine_ids: string[] }[],
+    durationSec: number
+  ) => {
+    const fd = new FormData();
+    fd.append("audio", audio);
+    fd.append("targets_json", JSON.stringify(targets));
+    fd.append("duration_sec", String(durationSec));
+    return fetch(`${API_BASE}/api/inference/runs/multi`, { method: "POST", body: fd })
+      .then(async (res) => {
+        if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+        return res.json() as Promise<{ run_id: string }>;
+      });
+  },
   getRun: (id: string) => req<InferenceRunDetail>(`/api/inference/runs/${id}`),
   listRuns: () => req<{ runs: InferenceRunSummary[] }>("/api/inference/runs"),
+  stopRun: (id: string) =>
+    req<{ ok: boolean }>(`/api/inference/runs/${id}/stop`, { method: "POST" }),
+  deleteRun: (id: string) =>
+    req<{ ok: boolean }>(`/api/inference/runs/${id}`, { method: "DELETE" }),
+  diagnoseMachine: (id: string) =>
+    req<Record<string, string>>(`/api/machines/${id}/diagnose`, { method: "POST" }),
   installAsrRuntime: (machineId: string) =>
     req<{ ok: boolean; output: string }>(`/api/inference/install-runtime/${machineId}`, {
       method: "POST",
