@@ -13,11 +13,16 @@ from .config import CONFIG
 log = logging.getLogger("infervoice.nvidia")
 
 NVIDIA_BASE = "https://integrate.api.nvidia.com/v1"
+NVCF_FUNCTIONS = "https://api.nvcf.nvidia.com/v2/nvcf/functions"
 
 STT_PATTERNS = re.compile(
-    r"(parakeet|canary|asr|speech|stt|voice|transcri)", re.IGNORECASE
+    r"(parakeet|canary|asr|stt|transcri)", re.IGNORECASE
 )
 TTS_EXCLUDE = re.compile(r"(^|[^a-z])(tts|speech-synthesis|speechsynth)([^a-z]|$)|megatron|t5", re.IGNORECASE)
+TTS_PATTERNS = re.compile(
+    r"(^|[^a-z])(tts|speech-synthesis|speechsynth|magpie.*(speech|tts)|riva.*(speech|tts)|kokoro)([^a-z]|$)",
+    re.IGNORECASE,
+)
 
 
 class NvidiaError(RuntimeError):
@@ -110,25 +115,32 @@ async def fetch_live_stt_models() -> list[dict]:
     now = time.monotonic()
     if _catalog_cache and now - _catalog_cache[0] < CATALOG_TTL:
         return _catalog_cache[1]
-    async with httpx.AsyncClient(timeout=25) as client:
+    speech: list[dict] = []
+    async with httpx.AsyncClient(timeout=30) as client:
         res = await client.get(
-            f"{NVIDIA_BASE}/models",
-            headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+            NVCF_FUNCTIONS,
+            params={"visibility": "public,authorized"},
+            headers={"Authorization": f"Bearer {key}"},
         )
         if res.status_code == 401:
             raise NvidiaError("NVIDIA rejected the stored API key (401) — re-save it")
         res.raise_for_status()
-        all_models = res.json().get("data", [])
-    stt: list[dict] = []
-    for m in all_models:
-        mid = str(m.get("id", ""))
-        if TTS_EXCLUDE.search(mid):
+        fns = res.json().get("functions") or []
+    for f in fns:
+        if f.get("status") != "ACTIVE":
             continue
-        if STT_PATTERNS.search(mid):
-            stt.append(m)
-    _catalog_cache = (now, stt)
-    log.info("nvidia catalog: %d total, %d classified STT", len(all_models), len(stt))
-    return stt
+        name = f.get("name", "") or ""
+        if TTS_PATTERNS.search(name):
+            speech.append(
+                {"id": name, "function_id": f.get("id"), "owned_by": "nvidia", "task": "tts"}
+            )
+        elif STT_PATTERNS.search(name):
+            speech.append(
+                {"id": name, "function_id": f.get("id"), "owned_by": "nvidia", "task": "stt"}
+            )
+    _catalog_cache = (now, speech)
+    log.info("nvidia catalog: %d NVCF speech functions (STT/TTS)", len(speech))
+    return speech
 
 
 class NvidiaModelInfo:
@@ -140,6 +152,9 @@ class NvidiaModelInfo:
         description: str,
         downloadable: bool,
         source: str,
+        task: str = "stt",
+        api_supported: bool = False,
+        function_id: str | None = None,
     ) -> None:
         self.nim_id = nim_id
         self.family = family
@@ -147,6 +162,9 @@ class NvidiaModelInfo:
         self.description = description
         self.downloadable = downloadable
         self.source = source
+        self.task = task
+        self.api_supported = api_supported
+        self.function_id = function_id
 
     def as_dict(self) -> dict:
         return {
@@ -156,6 +174,10 @@ class NvidiaModelInfo:
             "description": self.description,
             "downloadable": self.downloadable,
             "source": self.source,
+            "task": self.task,
+            "api_supported": self.api_supported,
+            "function_id": self.function_id,
+            "size_gb": None,
         }
 
 
@@ -167,6 +189,7 @@ SEED_MODELS: list[NvidiaModelInfo] = [
         "600M multilingual ASR, 25 EU languages, auto language detect — Open ASR leaderboard #1",
         True,
         "curated",
+        task="stt",
     ),
     NvidiaModelInfo(
         "parakeet-tdt-0.6b-v2",
@@ -175,6 +198,7 @@ SEED_MODELS: list[NvidiaModelInfo] = [
         "600M English ASR, fast long-form transcription with word timestamps",
         True,
         "curated",
+        task="stt",
     ),
     NvidiaModelInfo(
         "canary-1b-v2",
@@ -183,6 +207,7 @@ SEED_MODELS: list[NvidiaModelInfo] = [
         "1B multilingual ASR + speech translation across 25 European languages",
         True,
         "curated",
+        task="stt",
     ),
     NvidiaModelInfo(
         "canary-1b-flash",
@@ -191,6 +216,7 @@ SEED_MODELS: list[NvidiaModelInfo] = [
         "Fast 1B multilingual ASR tuned for low latency",
         True,
         "curated",
+        task="stt",
     ),
     NvidiaModelInfo(
         "parakeet-ctc-1.1b",
@@ -199,19 +225,43 @@ SEED_MODELS: list[NvidiaModelInfo] = [
         "1.1B English CTC model, robust streaming-style recognition",
         True,
         "curated",
+        task="stt",
+    ),
+    NvidiaModelInfo(
+        "kokoro-82m-v1.0",
+        "Kokoro",
+        "hexgrad/Kokoro-82M",
+        "82M natural TTS with 60+ voices and multilingual support (MLX local)",
+        True,
+        "curated",
+        task="tts",
+    ),
+    NvidiaModelInfo(
+        "nvidia/tts-1.0",
+        "TTS",
+        None,
+        "NVIDIA Riva cloud TTS via build.nvidia.com (API only)",
+        False,
+        "api",
+        task="tts",
+        api_supported=True,
     ),
 ]
 
 
-def _family_of(model_id: str) -> str:
+def _family_of(model_id: str, task: str = "stt") -> str:
     low = model_id.lower()
+    if "conformer" in low or "nemotron" in low or "whisper" in low or "riva" in low:
+        return "Riva"
     if "parakeet" in low:
         return "Parakeet"
     if "canary" in low:
         return "Canary"
+    if "kokoro" in low:
+        return "Kokoro"
     if "riva" in low:
         return "Riva"
-    return "Speech"
+    return "TTS" if task == "tts" else "Speech"
 
 
 def _find_hf_repo(nim_id: str) -> str | None:
@@ -219,9 +269,7 @@ def _find_hf_repo(nim_id: str) -> str | None:
     for seed in SEED_MODELS:
         if seed.nim_id.lower() == norm:
             return seed.hf_repo
-    if "/" in nim_id and nim_id.lower().startswith("nvidia/") and STT_PATTERNS.search(nim_id):
-        candidate = "nvidia/" + nim_id.split("/")[-1].lower().replace("_", "-")
-        return candidate
+    # NVCF cloud speech functions are API-only; no local MLX weights asserted yet.
     return None
 
 
@@ -240,29 +288,40 @@ async def get_stt_catalog() -> dict:
             mid = str(m.get("id", ""))
             if not mid:
                 continue
+            task = str(m.get("task") or "stt")
             repo = _find_hf_repo(mid)
             entry = {
                 "nim_id": mid,
-                "family": _family_of(mid),
+                "family": _family_of(mid, task),
                 "hf_repo": repo,
-                "description": f"Listed on build.nvidia.com · owned_by {m.get('owned_by', 'nvidia')}",
+                "description": f"NVIDIA cloud API · {task.upper()}",
                 "downloadable": bool(repo),
                 "source": "api",
                 "api_present": True,
+                "task": task,
+                "api_supported": True,
+                "function_id": m.get("function_id"),
+                "size_gb": None,
             }
             key = mid.lower().replace("_", "-")
             existing = by_id.pop(key, None)
             if existing:
-                existing.update({"source": "curated+api", "api_present": True})
+                existing.update({"source": "curated+api", "api_present": True, "api_supported": True})
+                if not existing["function_id"] and entry.get("function_id"):
+                    existing["function_id"] = entry["function_id"]
                 if not existing["hf_repo"] and repo:
                     existing["hf_repo"] = repo
                     existing["downloadable"] = True
                 by_id[key] = existing
             else:
-                entry["size_gb"] = None
                 by_id[key] = entry
     except (NvidiaError, httpx.HTTPError) as exc:
         live_error = str(exc)
+
+    # STT seeds that exist on the live NVIDIA catalog expose a cloud API endpoint.
+    for d in by_id.values():
+        if d["task"] == "stt" and d.get("api_present"):
+            d["api_supported"] = True
 
     repos = {m["nim_id"]: m["hf_repo"] for m in by_id.values() if m.get("downloadable") and m.get("hf_repo")}
     if repos:

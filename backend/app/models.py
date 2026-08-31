@@ -72,9 +72,12 @@ class ModelDownloadJob(SQLModel, table=True):
 class InferenceRun(SQLModel, table=True):
     id: str = Field(default_factory=lambda: uuid4().hex, primary_key=True)
     model_id: str = Field(index=True)
+    task_type: str = Field(default="stt")
+    delivery: str = Field(default="download")
     audio_path: str
     audio_name: str
     audio_duration: Optional[float] = None
+    text_input: Optional[str] = None
     status: str = Field(default="running", index=True)
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
@@ -85,8 +88,11 @@ class InferenceTask(SQLModel, table=True):
     machine_id: str
     machine_name: str
     nim_id: str
+    task_type: str = Field(default="stt")
+    delivery: str = Field(default="download")
     status: str = Field(default="queued", index=True)
     transcript: Optional[str] = None
+    audio_out: Optional[str] = None
     error: Optional[str] = Field(default=None, max_length=500)
     wall_ms: Optional[int] = None
     progress_pct: Optional[float] = None
@@ -151,6 +157,8 @@ class MachineCreate(BaseModel):
 class MachineUpdate(BaseModel):
     name: str | None = None
     models_root: str | None = None
+    host: str | None = None
+    port: int | None = Field(default=None, ge=1, le=65535)
 
 
 class ExecIn(BaseModel):

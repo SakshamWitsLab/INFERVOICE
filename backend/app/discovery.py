@@ -68,7 +68,7 @@ class DiscoveryService:
         if self._zc is None:
             return
         try:
-            info = await self._zc.async_request(service_type=name, timeout=1500)
+            info = await self._zc.async_get_service_info(MDNS_SSH_TYPE, name, timeout=1500)
         except Exception as exc:
             log.warning("mDNS resolve failed for %s: %s", name, exc)
             return

@@ -33,15 +33,19 @@ import { colorForMachine } from "@/lib/colors";
 const FAMILY_COLORS: Record<string, string> = {
   Parakeet: "text-violet-300 border-violet-400/30 bg-violet-400/10",
   Canary: "text-amber-300 border-amber-400/30 bg-amber-400/10",
+  Kokoro: "text-rose-300 border-rose-400/30 bg-rose-400/10",
   Riva: "text-sky-300 border-sky-400/30 bg-sky-400/10",
   Speech: "text-emerald-300 border-emerald-400/30 bg-emerald-400/10",
+  TTS: "text-fuchsia-300 border-fuchsia-400/30 bg-fuchsia-400/10",
 };
 
 const FAMILY_GRADIENTS: Record<string, string> = {
   Parakeet: "from-violet-600/40 to-fuchsia-600/20",
   Canary: "from-amber-500/40 to-orange-600/20",
+  Kokoro: "from-rose-600/40 to-pink-600/20",
   Riva: "from-sky-500/40 to-cyan-600/20",
   Speech: "from-emerald-500/40 to-teal-600/20",
+  TTS: "from-fuchsia-600/40 to-purple-600/20",
 };
 
 export default function ModelsPage() {
@@ -295,6 +299,7 @@ function DeploymentMatrix() {
 
 function Catalog() {
   const [search, setSearch] = useState("");
+  const [task, setTask] = useState<"stt" | "tts">("stt");
   const [deployTarget, setDeployTarget] = useState<NvidiaModelInfo | null>(null);
   const [preselectMachine, setPreselectMachine] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<string | null>(null);
@@ -315,10 +320,12 @@ function Catalog() {
 
   const models = useMemo(
     () =>
-      (modelsRes?.models ?? []).filter((m) =>
-        search.trim() ? m.nim_id.toLowerCase().includes(search.toLowerCase()) : true
-      ),
-    [modelsRes, search]
+      (modelsRes?.models ?? [])
+        .filter((m) => (m.task ?? "stt") === task)
+        .filter((m) =>
+          search.trim() ? m.nim_id.toLowerCase().includes(search.toLowerCase()) : true
+        ),
+    [modelsRes, search, task]
   );
 
   function openDeploy(m: NvidiaModelInfo, machineId?: string) {
@@ -338,12 +345,33 @@ function Catalog() {
   return (
     <section className="relative mt-8">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <h2 className="text-sm font-medium text-zinc-300">
-          Speech-to-text models <span className="text-zinc-600">({models.length})</span>
-          <span className="ml-3 hidden text-[11px] font-normal text-zinc-600 lg:inline">
-            tip: drag a card onto a Mac in the dock →
-          </span>
-        </h2>
+        <div className="flex items-center gap-3">
+          <div className="inline-flex overflow-hidden rounded-lg border border-white/10">
+            <button
+              onClick={() => setTask("stt")}
+              className={`px-3 py-1.5 text-xs font-semibold ${
+                task === "stt" ? "bg-violet-600 text-white" : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              STT
+            </button>
+            <button
+              onClick={() => setTask("tts")}
+              className={`px-3 py-1.5 text-xs font-semibold ${
+                task === "tts" ? "bg-fuchsia-600 text-white" : "text-zinc-400 hover:text-zinc-200"
+              }`}
+            >
+              TTS
+            </button>
+          </div>
+          <h2 className="text-sm font-medium text-zinc-300">
+            {task === "stt" ? "Speech-to-text" : "Text-to-speech"} models{" "}
+            <span className="text-zinc-600">({models.length})</span>
+            <span className="ml-3 hidden text-[11px] font-normal text-zinc-600 lg:inline">
+              tip: drag a card onto a Mac in the dock →
+            </span>
+          </h2>
+        </div>
         <label className="relative">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-zinc-500" />
           <input
@@ -385,11 +413,23 @@ function Catalog() {
                   <span className="text-[10px] font-bold uppercase tracking-widest text-white/90">
                     {m.family}
                   </span>
-                  {m.size_gb != null && (
-                    <span className="rounded-md bg-black/40 px-1.5 py-0.5 font-mono text-[10px] text-zinc-100">
-                      {m.size_gb} GB
-                    </span>
-                  )}
+                  <span className="flex items-center gap-1">
+                    {m.downloadable && (
+                      <span className="rounded-md bg-black/40 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-emerald-300">
+                        Local
+                      </span>
+                    )}
+                    {m.api_supported && (
+                      <span className="rounded-md bg-black/40 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-sky-300">
+                        API
+                      </span>
+                    )}
+                    {m.size_gb != null && (
+                      <span className="rounded-md bg-black/40 px-1.5 py-0.5 font-mono text-[10px] text-zinc-100">
+                        {m.size_gb} GB
+                      </span>
+                    )}
+                  </span>
                 </div>
                 <p className="mt-0.5 truncate font-mono text-xs text-white/95">{m.nim_id}</p>
               </div>

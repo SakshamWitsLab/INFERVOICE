@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { memo, useState } from "react";
 import {
   AlertTriangle,
   ArrowRight,
@@ -21,8 +21,10 @@ import { api, fmtGB, relTime } from "@/lib/api";
 import { StatusDot } from "./Status";
 import { StorageBar } from "./StorageBar";
 import { EditMachineDialog } from "./EditMachineDialog";
+import { InstallAsrButton } from "./InstallAsrButton";
+import { MachineFiles } from "./MachineFiles";
 
-export function MachineCard({
+export const MachineCard = memo(function MachineCard({
   machine,
   onChanged,
 }: {
@@ -126,6 +128,9 @@ export function MachineCard({
         </div>
       )}
 
+      <InstallAsrButton machine={machine} />
+      <MachineFiles machineId={machine.id} />
+
       <Link
         href={`/machines/${machine.id}`}
         className="absolute inset-x-0 bottom-0 -z-10 h-px"
@@ -144,7 +149,7 @@ export function MachineCard({
       )}
     </div>
   );
-}
+})
 
 function Spec({ icon, value }: { icon: React.ReactNode; value: string }) {
   return (

@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse, Response
+from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
@@ -13,10 +15,12 @@ from ..db import get_session
 from ..inference import (
     cancel_run,
     deployed_machine_ids,
-    install_asr_runtime,
+    get_install_job,
+    install_out,
     is_runnable,
     is_running,
     spawn_orchestration,
+    start_install_job,
 )
 from ..models import InferenceRun, InferenceTask, Machine
 from ..nvidia import get_stt_catalog
@@ -35,8 +39,11 @@ def _task_out(t: InferenceTask) -> dict:
         "machine_id": t.machine_id,
         "machine_name": t.machine_name,
         "nim_id": t.nim_id,
+        "task_type": t.task_type,
+        "delivery": t.delivery,
         "status": t.status,
         "transcript": t.transcript,
+        "audio_out": t.audio_out,
         "error": t.error,
         "wall_ms": t.wall_ms,
         "progress_pct": t.progress_pct,
@@ -139,6 +146,7 @@ async def create_multi_run(
     audio: UploadFile = File(...),
     targets_json: str = Form(...),
     duration_sec: float = Form(0.0),
+    audio_name: str = Form(""),
     session: AsyncSession = Depends(get_session),
 ):
     try:
@@ -154,10 +162,12 @@ async def create_multi_run(
     if ext not in (".wav", ".mp3", ".flac", ".m4a", ".ogg"):
         ext = ".wav"
 
+    display_name = audio_name.strip() if audio_name and audio_name.strip() else (audio.filename or "recording.wav")
+
     run = InferenceRun(
         model_id="multi",
         audio_path="",
-        audio_name=audio.filename or "recording.wav",
+        audio_name=display_name,
         audio_duration=duration_sec or None,
     )
     audio_dir = CONFIG.data_dir / "audio"
@@ -178,8 +188,29 @@ async def create_multi_run(
     for pair in targets:
         mid = pair.get("model_id", "")
         mids = pair.get("machine_ids", [])
+        delivery = pair.get("delivery", "download")
+        if delivery not in ("download", "api"):
+            delivery = "download"
+        ttype = pair.get("task_type", "stt")
+        if ttype not in ("stt", "tts"):
+            ttype = "stt"
         model = catalog_map.get(mid)
         if not model:
+            continue
+        if delivery == "api":
+            if not model.get("api_supported"):
+                continue
+            session.add(
+                InferenceTask(
+                    run_id=run.id,
+                    machine_id="cloud",
+                    machine_name="cloud",
+                    nim_id=mid,
+                    task_type=ttype,
+                    delivery="api",
+                )
+            )
+            task_count += 1
             continue
         for machine_id in mids:
             m = await session.get(Machine, machine_id)
@@ -191,6 +222,8 @@ async def create_multi_run(
                     machine_id=m.id,
                     machine_name=m.name,
                     nim_id=mid,
+                    task_type=ttype,
+                    delivery="download",
                 )
             )
             task_count += 1
@@ -205,6 +238,93 @@ async def create_multi_run(
     return {"run_id": run.id}
 
 
+@router.post("/runs/tts")
+async def create_tts_run(
+    text_input: str = Form(...),
+    targets_json: str = Form(...),
+    delivery: str = Form("download"),
+    audio_name: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+):
+    text_input = text_input.strip()
+    if not text_input:
+        raise HTTPException(400, "text_input cannot be empty")
+    if delivery not in ("download", "api"):
+        raise HTTPException(400, "delivery must be 'download' or 'api'")
+    try:
+        targets = json.loads(targets_json)
+        assert isinstance(targets, list) and len(targets) > 0
+    except (json.JSONDecodeError, AssertionError):
+        raise HTTPException(400, "targets_json must be a non-empty JSON array of {model_id, machine_ids}")
+
+    catalog = await get_stt_catalog()
+    catalog_map = {m["nim_id"]: m for m in catalog["models"]}
+
+    display_name = audio_name.strip() if audio_name and audio_name.strip() else "tts_run"
+
+    run = InferenceRun(
+        model_id="multi",
+        task_type="tts",
+        delivery=delivery,
+        audio_path="",
+        audio_name=display_name,
+        text_input=text_input,
+    )
+    session.add(run)
+    await session.commit()
+    await session.refresh(run)
+
+    task_count = 0
+    for pair in targets:
+        mid = pair.get("model_id", "")
+        pdel = pair.get("delivery", delivery)
+        if pdel not in ("download", "api"):
+            pdel = "download"
+        model = catalog_map.get(mid)
+        if not model or model.get("task") != "tts":
+            continue
+        if pdel == "api" and not model.get("api_supported"):
+            continue
+        if pdel == "api":
+            session.add(
+                InferenceTask(
+                    run_id=run.id,
+                    machine_id="cloud",
+                    machine_name="cloud",
+                    nim_id=mid,
+                    task_type="tts",
+                    delivery="api",
+                )
+            )
+            task_count += 1
+            continue
+        mids = pair.get("machine_ids", [])
+        for machine_id in mids:
+            m = await session.get(Machine, machine_id)
+            if not m:
+                continue
+            session.add(
+                InferenceTask(
+                    run_id=run.id,
+                    machine_id=m.id,
+                    machine_name=m.name,
+                    nim_id=mid,
+                    task_type="tts",
+                    delivery="download",
+                )
+            )
+            task_count += 1
+
+    if task_count == 0:
+        await session.delete(run)
+        await session.commit()
+        raise HTTPException(400, "no valid model+machine pairs for TTS delivery")
+
+    await session.commit()
+    spawn_orchestration(run.id, None)
+    return {"run_id": run.id}
+
+
 @router.get("/runs/{run_id}")
 async def get_run(run_id: str, session: AsyncSession = Depends(get_session)):
     run = await session.get(InferenceRun, run_id)
@@ -216,6 +336,8 @@ async def get_run(run_id: str, session: AsyncSession = Depends(get_session)):
         "run": {
             "id": run.id,
             "model_id": run.model_id,
+            "task_type": run.task_type,
+            "delivery": run.delivery,
             "audio_name": run.audio_name,
             "audio_duration": run.audio_duration,
             "status": "running" if await is_running(run.id) else run.status,
@@ -276,6 +398,8 @@ async def list_runs(session: AsyncSession = Depends(get_session)):
         entry = {
             "id": r.id,
             "model_id": r.model_id,
+            "task_type": r.task_type,
+            "delivery": r.delivery,
             "audio_name": r.audio_name,
             "status": "running" if await is_running(r.id) else r.status,
             "created_at": r.created_at.isoformat(),
@@ -288,15 +412,121 @@ async def list_runs(session: AsyncSession = Depends(get_session)):
     return {"runs": out}
 
 
+class RenameRunBody(BaseModel):
+    audio_name: str
+
+
+@router.patch("/runs/{run_id}")
+async def rename_run(
+    run_id: str, body: RenameRunBody, session: AsyncSession = Depends(get_session)
+):
+    run = await session.get(InferenceRun, run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    name = body.audio_name.strip()
+    if not name:
+        raise HTTPException(400, "audio_name cannot be empty")
+    run.audio_name = name[:200]
+    session.add(run)
+    await session.commit()
+    await session.refresh(run)
+    return {"id": run.id, "audio_name": run.audio_name}
+
+
 @router.post("/install-runtime/{machine_id}")
 async def bootstrap_runtime(machine_id: str, session: AsyncSession = Depends(get_session)):
-    from ..inference import install_asr_runtime as _install
     from ..models import Machine
 
     machine = await session.get(Machine, machine_id)
     if not machine:
         raise HTTPException(404, "machine not found")
-    try:
-        return await _install(machine)
-    except SSHError as exc:
-        raise HTTPException(502, detail=str(exc))
+    job = start_install_job(machine)
+    return {"ok": True, "job": install_out(job)}
+
+
+@router.get("/install-runtime/{machine_id}/status")
+async def bootstrap_runtime_status(machine_id: str):
+    job = get_install_job(machine_id)
+    if not job:
+        return {"machine_id": machine_id, "status": "none"}
+    return install_out(job)
+
+
+_MEDIA_BY_EXT = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".m4a": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".mp4": "audio/mp4",
+    ".webm": "audio/webm",
+}
+
+
+@router.get("/audio/{run_id}")
+async def get_audio(run_id: str, session: AsyncSession = Depends(get_session)):
+    run = await session.get(InferenceRun, run_id)
+    if not run:
+        raise HTTPException(404, "run not found")
+    path = Path(run.audio_path)
+    if not path.exists():
+        raise HTTPException(404, "audio file not found")
+    media = _MEDIA_BY_EXT.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media, filename=run.audio_name or path.name)
+
+
+@router.get("/audio-out/{task_id}")
+async def get_audio_out(task_id: str, session: AsyncSession = Depends(get_session)):
+    task = await session.get(InferenceTask, task_id)
+    if not task:
+        raise HTTPException(404, "task not found")
+    if not task.audio_out:
+        raise HTTPException(404, "no audio output available")
+    path = Path(task.audio_out)
+    if not path.exists():
+        raise HTTPException(404, "audio output file not found")
+    media = _MEDIA_BY_EXT.get(path.suffix.lower(), "audio/wav")
+    return FileResponse(path, media_type=media, filename=f"{task.run_id}_{task.nim_id}_tts.wav")
+
+
+@router.get("/transcript/{task_id}")
+async def get_transcript(task_id: str, session: AsyncSession = Depends(get_session)):
+    import tempfile, os
+
+    task = await session.get(InferenceTask, task_id)
+    if not task:
+        raise HTTPException(404, "task not found")
+    if not task.transcript:
+        raise HTTPException(404, "no transcript available")
+    run = await session.get(InferenceRun, task.run_id)
+    base_name = (run.audio_name.rsplit(".", 1)[0] if run and run.audio_name else "transcript")
+    return Response(
+        content=task.transcript,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{base_name}_{task.nim_id}_response.txt"'
+        },
+    )
+
+
+@router.delete("/tasks/{task_id}")
+async def delete_task(task_id: str, session: AsyncSession = Depends(get_session)):
+    task = await session.get(InferenceTask, task_id)
+    if not task:
+        raise HTTPException(404, "task not found")
+    run_id = task.run_id
+    await session.delete(task)
+    result = await session.exec(select(InferenceTask).where(InferenceTask.run_id == run_id))
+    remaining = list(result.all())
+    deleted_run = False
+    if not remaining:
+        run = await session.get(InferenceRun, run_id)
+        if run:
+            try:
+                Path(run.audio_path).unlink(missing_ok=True)
+            except Exception:
+                pass
+            await session.delete(run)
+            deleted_run = True
+    await session.commit()
+    return {"ok": True, "deleted_run": deleted_run}

@@ -72,6 +72,9 @@ export interface FleetEntry {
   sample: MetricSample | null;
 }
 
+export type TaskType = "stt" | "tts";
+export type Delivery = "download" | "api";
+
 export interface NvidiaModelInfo {
   nim_id: string;
   family: string;
@@ -79,6 +82,8 @@ export interface NvidiaModelInfo {
   description: string;
   downloadable: boolean;
   source: string;
+  task: TaskType;
+  api_supported: boolean;
   size_gb: number | null;
 }
 
@@ -119,8 +124,11 @@ export interface InferenceTask {
   machine_id: string;
   machine_name: string;
   nim_id: string;
+  task_type: TaskType;
+  delivery: Delivery;
   status: "queued" | "uploading" | "downloading_model" | "inferring" | "installing_runtime" | "done" | "failed" | "cancelled";
   transcript: string | null;
+  audio_out: string | null;
   error: string | null;
   wall_ms: number | null;
   progress_pct: number | null;
@@ -132,6 +140,8 @@ export interface InferenceRunDetail {
   run: {
     id: string;
     model_id: string;
+    task_type: TaskType;
+    delivery: Delivery;
     audio_name: string;
     audio_duration: number | null;
     status: string;
@@ -144,11 +154,36 @@ export interface InferenceRunSummary {
   id: string;
   model_id: string;
   model_ids?: string[];
+  task_type: TaskType;
+  delivery: Delivery;
   audio_name: string;
   status: string;
   created_at: string;
   machines: string[];
   done: number;
+}
+
+export interface MachineFile {
+  task_id: string;
+  run_id: string;
+  audio_name: string | null;
+  audio_file: string | null;
+  model_id: string;
+  status: string;
+  transcript: string | null;
+  error: string | null;
+  wall_ms: number | null;
+  created_at: string;
+}
+
+export interface InstallStatus {
+  machine_id: string;
+  status: "queued" | "running" | "done" | "failed" | "none";
+  ok: boolean;
+  log_text: string;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
 }
 
 export interface ExecResult {
@@ -221,7 +256,7 @@ export const api = {
     }),
   updateMachine: (
     id: string,
-    body: { name?: string; models_root?: string }
+    body: { name?: string; models_root?: string; host?: string; port?: number }
   ) =>
     req<Machine>(`/api/machines/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   inferenceCatalog: () =>
@@ -242,14 +277,33 @@ export const api = {
   },
   createMultiRun: (
     audio: File,
-    targets: { model_id: string; machine_ids: string[] }[],
-    durationSec: number
+    targets: { model_id: string; machine_ids: string[]; delivery?: Delivery; task_type?: TaskType }[],
+    durationSec: number,
+    audioName?: string
   ) => {
     const fd = new FormData();
     fd.append("audio", audio);
     fd.append("targets_json", JSON.stringify(targets));
     fd.append("duration_sec", String(durationSec));
+    if (audioName) fd.append("audio_name", audioName);
     return fetch(`${API_BASE}/api/inference/runs/multi`, { method: "POST", body: fd })
+      .then(async (res) => {
+        if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
+        return res.json() as Promise<{ run_id: string }>;
+      });
+  },
+  createTtsRun: (
+    textInput: string,
+    targets: { model_id: string; machine_ids: string[]; delivery?: Delivery }[],
+    delivery: Delivery,
+    audioName?: string
+  ) => {
+    const fd = new FormData();
+    fd.append("text_input", textInput);
+    fd.append("targets_json", JSON.stringify(targets));
+    fd.append("delivery", delivery);
+    if (audioName) fd.append("audio_name", audioName);
+    return fetch(`${API_BASE}/api/inference/runs/tts`, { method: "POST", body: fd })
       .then(async (res) => {
         if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
         return res.json() as Promise<{ run_id: string }>;
@@ -257,6 +311,11 @@ export const api = {
   },
   getRun: (id: string) => req<InferenceRunDetail>(`/api/inference/runs/${id}`),
   listRuns: () => req<{ runs: InferenceRunSummary[] }>("/api/inference/runs"),
+  renameRun: (id: string, audio_name: string) =>
+    req<{ id: string; audio_name: string }>(`/api/inference/runs/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ audio_name }),
+    }),
   stopRun: (id: string) =>
     req<{ ok: boolean }>(`/api/inference/runs/${id}/stop`, { method: "POST" }),
   deleteRun: (id: string) =>
@@ -264,8 +323,16 @@ export const api = {
   diagnoseMachine: (id: string) =>
     req<Record<string, string>>(`/api/machines/${id}/diagnose`, { method: "POST" }),
   installAsrRuntime: (machineId: string) =>
-    req<{ ok: boolean; output: string }>(`/api/inference/install-runtime/${machineId}`, {
+    req<{ ok: boolean; job: InstallStatus }>(`/api/inference/install-runtime/${machineId}`, {
       method: "POST",
+    }),
+  installRuntimeStatus: (machineId: string) =>
+    req<InstallStatus>(`/api/inference/install-runtime/${machineId}/status`),
+  machineFiles: (machineId: string) =>
+    req<{ files: MachineFile[] }>(`/api/machines/${machineId}/files`),
+  deleteTask: (taskId: string) =>
+    req<{ ok: boolean; deleted_run: boolean }>(`/api/inference/tasks/${taskId}`, {
+      method: "DELETE",
     }),
   addMachine: (body: { name?: string; host: string; port?: number; username: string }) =>
     req<Machine>("/api/machines", { method: "POST", body: JSON.stringify(body) }),
@@ -289,6 +356,18 @@ export function wsTerminalUrl(machineId: string): string {
   return `${API_BASE.replace(/^http/, "ws")}/ws/terminal/${machineId}`;
 }
 
+export function audioUrl(runId: string): string {
+  return `${API_BASE}/api/inference/audio/${runId}`;
+}
+
+export function transcriptUrl(taskId: string): string {
+  return `${API_BASE}/api/inference/transcript/${taskId}`;
+}
+
+export function audioOutUrl(taskId: string): string {
+  return `${API_BASE}/api/inference/audio-out/${taskId}`;
+}
+
 export function fmtGB(gb: number | null | undefined, digits = 0): string {
   if (gb == null) return "—";
   if (gb >= 1024) return `${(gb / 1024).toFixed(digits || 1)} TB`;
@@ -309,7 +388,9 @@ export function fmtUptime(seconds: number | null): string {
 
 export function relTime(iso: string | null): string {
   if (!iso) return "never";
-  const diff = Date.now() - new Date(iso).getTime();
+  const hasTz = /Z$|[+-]\d\d:?\d\d$/.test(iso);
+  const parsed = new Date(hasTz ? iso : iso + "Z").getTime();
+  const diff = Date.now() - parsed;
   const s = Math.max(0, Math.floor(diff / 1000));
   if (s < 60) return `${s}s ago`;
   if (s < 3600) return `${Math.floor(s / 60)}m ago`;

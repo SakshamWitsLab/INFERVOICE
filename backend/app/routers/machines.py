@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import select
@@ -12,14 +14,19 @@ from ..metrics import MetricSample, sample_metrics
 from ..models import (
     ExecIn,
     ExecOut,
+    InferenceRun,
+    InferenceTask,
     InstallKeyIn,
     Machine,
     MachineCreate,
     MachineOut,
     MachineUpdate,
+    ModelDownloadJob,
 )
 from ..ops import check_machine, install_key, refresh_machine
 from ..ssh_pool import POOL, SSHError, run_cmd
+
+log = logging.getLogger("infervoice.machines")
 
 router = APIRouter(prefix="/api/machines", tags=["machines"])
 
@@ -55,10 +62,42 @@ async def list_machines(session: AsyncSession = Depends(get_session)):
 
 @router.post("", response_model=MachineOut, status_code=201)
 async def add_machine(body: MachineCreate, session: AsyncSession = Depends(get_session)):
-    machine = Machine(name=(body.name or body.host), host=body.host.strip(), port=body.port, username=body.username.strip())
-    session.add(machine)
-    await session.commit()
-    await session.refresh(machine)
+    host = body.host.strip()
+    username = body.username.strip()
+    name = (body.name or host).strip()
+
+    result = await session.exec(
+        select(Machine).where(Machine.name == name, Machine.username == username)
+    )
+    existing = result.first()
+    machine: Machine
+    if existing is not None and (existing.host != host or existing.port != body.port):
+        old = f"{existing.host}:{existing.port}"
+        await POOL.invalidate(existing.host, existing.port, existing.username)
+        existing.host = host
+        existing.port = body.port
+        existing.status = "unknown"
+        existing.error = None
+        existing.updated_at = datetime.now(timezone.utc)
+        session.add(existing)
+        await session.commit()
+        await session.refresh(existing)
+        log.info(
+            "machine %s detected at new address %s:%s (was %s) — keeping record",
+            existing.name,
+            host,
+            body.port,
+            old,
+        )
+        machine = existing
+    elif existing is not None:
+        machine = existing
+    else:
+        machine = Machine(name=name, host=host, port=body.port, username=username)
+        session.add(machine)
+        await session.commit()
+        await session.refresh(machine)
+
     try:
         await check_machine(session, machine)
         if machine.status == "online":
@@ -86,16 +125,64 @@ async def get_machine(machine_id: str, session: AsyncSession = Depends(get_sessi
     return _out(await _get_or_404(machine_id, session))
 
 
+@router.get("/{machine_id}/files")
+async def machine_files(machine_id: str, session: AsyncSession = Depends(get_session)):
+    await _get_or_404(machine_id, session)
+    result = await session.exec(
+        select(InferenceTask)
+        .where(InferenceTask.machine_id == machine_id)
+        .order_by(InferenceTask.created_at.desc())
+        .limit(50)
+    )
+    tasks = list(result.all())
+    runs: dict[str, InferenceRun] = {}
+    out = []
+    for t in tasks:
+        run = runs.get(t.run_id)
+        if run is None:
+            run = await session.get(InferenceRun, t.run_id)
+            runs[t.run_id] = run
+        out.append(
+            {
+                "task_id": t.id,
+                "run_id": t.run_id,
+                "audio_name": run.audio_name if run else None,
+                "audio_file": run.audio_path.rsplit("/", 1)[-1] if run else None,
+                "model_id": t.nim_id,
+                "status": t.status,
+                "transcript": t.transcript,
+                "error": t.error,
+                "wall_ms": t.wall_ms,
+                "created_at": t.created_at.isoformat(),
+            }
+        )
+    return {"files": out}
+
+
 @router.patch("/{machine_id}", response_model=MachineOut)
 async def update_machine(machine_id: str, body: MachineUpdate, session: AsyncSession = Depends(get_session)):
     m = await _get_or_404(machine_id, session)
     if body.name is not None:
         m.name = body.name.strip() or m.name
+    if body.host is not None:
+        host = body.host.strip()
+        if host and host != m.host:
+            await POOL.invalidate(m.host, m.port, m.username)
+            m.host = host
+            m.status = "unknown"
+            m.error = None
+    if body.port is not None:
+        if body.port != m.port:
+            await POOL.invalidate(m.host, m.port, m.username)
+            m.port = body.port
+            m.status = "unknown"
+            m.error = None
     if body.models_root is not None:
         cleaned = body.models_root.strip()
         if cleaned and not cleaned.startswith(("~", "/", "$HOME")):
             raise HTTPException(400, "models path must be absolute or start with ~")
         m.models_root = _norm_root(cleaned) if cleaned else None
+    m.updated_at = datetime.now(timezone.utc)
     session.add(m)
     await session.commit()
     await session.refresh(m)
@@ -106,6 +193,9 @@ async def update_machine(machine_id: str, body: MachineUpdate, session: AsyncSes
 async def delete_machine(machine_id: str, session: AsyncSession = Depends(get_session)):
     m = await _get_or_404(machine_id, session)
     await POOL.invalidate(m.host, m.port, m.username)
+    jobs = await session.exec(select(ModelDownloadJob).where(ModelDownloadJob.machine_id == machine_id))
+    for job in jobs.all():
+        await session.delete(job)
     await session.delete(m)
     await session.commit()
 

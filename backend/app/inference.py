@@ -3,7 +3,10 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import os
 import time as _time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import asyncssh
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -12,11 +15,11 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 from .config import CONFIG
 from .models import InferenceRun, InferenceTask, Machine, ModelDownloadJob
-from .ssh_pool import POOL, run_cmd
+from .ssh_pool import POOL, run_cmd, run_cmd_live
 
 log = logging.getLogger("infervoice.inference")
 
-RUNNABLE_FAMILIES = {"Parakeet"}
+RUNNABLE_FAMILIES = {"Parakeet", "Kokoro"}
 AUDIO_REMOTE_DIR = "$HOME/infervoice_models/_audio"
 INF_TIMEOUT = 600
 
@@ -85,11 +88,87 @@ INSTALL_ASR_SCRIPT = (
 )
 
 
-async def install_asr_runtime(machine: Machine) -> dict:
+async def install_asr_runtime(
+    machine: Machine, log_cb: Callable[[str], None] | None = None
+) -> dict:
     conn = await POOL.get(machine.host, machine.port, machine.username)
-    code, out, err = await run_cmd(conn, INSTALL_ASR_SCRIPT, timeout=900, max_output=4096)
-    ok = "ALREADY_INSTALLED" in (out or "") or "INSTALL_OK" in (out or "")
-    return {"ok": ok, "output": ((out or "") + "\n" + (err or ""))[-2000:]}
+    if log_cb is None:
+        code, out, err = await run_cmd(conn, INSTALL_ASR_SCRIPT, timeout=900, max_output=4096)
+        output = f"{out or ''}\n{err or ''}"
+    else:
+        code, out = await run_cmd_live(
+            conn, INSTALL_ASR_SCRIPT, timeout=900, on_line=log_cb, max_output=16384
+        )
+        output = out or ""
+    ok = "ALREADY_INSTALLED" in output or "INSTALL_OK" in output
+    return {"ok": ok, "output": output[-2000:]}
+
+
+INSTALL_TTS_SCRIPT = (
+    'set +e; setopt nullglob 2>/dev/null; '
+    'VENV="$HOME/.infervoice/tts-venv"; '
+    'if [ -x "$VENV/bin/python" ] && "$VENV/bin/python" -c "import kokoro_mlx" 2>/dev/null; then '
+    'echo "ALREADY_INSTALLED"; exit 0; fi; '
+    'echo ">>> Searching for existing Python >= 3.10"; '
+    'PYBIN=""; '
+    'for candidate in '
+    '$HOME/.pyenv/versions/*/bin/python3 '
+    '/Library/Frameworks/Python.framework/Versions/*/bin/python3 '
+    '/opt/homebrew/bin/python3.13 '
+    '/opt/homebrew/bin/python3.12 '
+    '/opt/homebrew/bin/python3.11 '
+    '/opt/homebrew/bin/python3.10 '
+    '/opt/homebrew/bin/python3 '
+    '/usr/local/bin/python3 '
+    'python3 '
+    'python3.13 '
+    'python3.12 '
+    'python3.11 '
+    'python3.10; do '
+    '[ -x "$candidate" ] || continue; '
+    'if "$candidate" -c "import sys; exit(0 if sys.version_info >= (3, 10) else 1)" 2>/dev/null; then '
+    'echo ">>> compatible: $candidate ($("$candidate" --version 2>&1))"; '
+    '[ -z "$PYBIN" ] && PYBIN="$candidate"; '
+    'fi; done; '
+    'if [ -z "$PYBIN" ]; then echo ">>> No Python >= 3.10 found; bootstrapping via uv"; '
+    'export UV_NO_MODIFY_PATH=1; '
+    'export UV_PYTHON_INSTALL_DIR="$HOME/.infervoice/uv-python"; '
+    'export UV_CACHE_DIR="$HOME/.infervoice/.uv-cache"; '
+    'UV="$HOME/.local/bin/uv"; '
+    'if [ ! -x "$UV" ]; then '
+    'echo ">>> Installing uv"; '
+    'curl -LsSf https://astral.sh/uv/install.sh | sh || { echo "UV_INSTALL_FAILED"; exit 1; }; '
+    'fi; '
+    'echo ">>> uv installing Python 3.12"; '
+    '"$UV" python install 3.12 || { echo "UV_PYTHON_INSTALL_FAILED"; exit 1; }; '
+    'PYBIN="$("$UV" python find 3.12)" || { echo "UV_PYTHON_FIND_FAILED"; exit 1; }; '
+    'echo ">>> Using managed Python: $PYBIN ($("$PYBIN" --version 2>&1))"; '
+    'fi; '
+    '[ -n "$PYBIN" ] || { echo "NO_PYTHON3_10+"; exit 1; }; '
+    'echo "USING_PYTHON: $("$PYBIN" --version 2>&1)"; '
+    'echo ">>> Creating venv"; '
+    '"$PYBIN" -m venv "$VENV" || { echo "VENV_FAILED"; exit 1; }; '
+    'echo ">>> Installing kokoro-mlx"; '
+    '"$VENV/bin/pip" install -q --upgrade pip 2>/dev/null; '
+    '"$VENV/bin/pip" install -q "kokoro-mlx" || { echo "PIP_FAILED"; exit 1; }; '
+    '"$VENV/bin/python" -c "import kokoro_mlx" 2>/dev/null && echo INSTALL_OK || echo INSTALL_FAILED'
+)
+
+
+async def install_tts_runtime(
+    machine: Machine, log_cb: Callable[[str], None] | None = None
+) -> dict:
+    conn = await POOL.get(machine.host, machine.port, machine.username)
+    if log_cb is None:
+        code, out, err = await run_cmd(conn, INSTALL_TTS_SCRIPT, timeout=900, max_output=4096)
+        output = f"{out or ''}\n{err or ''}"
+    else:
+        code, out = await run_cmd_live(
+            conn, INSTALL_TTS_SCRIPT, timeout=900, on_line=log_cb, max_output=16384
+        )
+        output = out or ""
+    ok = "ALREADY_INSTALLED" in output or "INSTALL_OK" in output
+    return {"ok": ok, "output": output[-2000:]}
 
 
 async def _has_local_mlx_weights(conn: asyncssh.SSHClientConnection, remote_dir: str) -> bool:
@@ -377,9 +456,295 @@ async def _resolve_root(session: AsyncSession, machine: Machine) -> str:
     return global_root or MODELS_ROOT
 
 
+LOCAL_AUDIO_OUT_DIR = f"{CONFIG.data_dir}/generated" if hasattr(CONFIG, "data_dir") else "/tmp/infervoice/generated"
+
+
+async def _download_audio(
+    conn: asyncssh.SSHClientConnection, remote_path: str, local_path: str
+) -> None:
+    sftp_path = remote_path
+    if sftp_path.startswith("$HOME/"):
+        sftp_path = sftp_path[len("$HOME/"):]
+    async with conn.start_sftp_client() as sftp:
+        await sftp.get(sftp_path, local_path)
+
+
+def _output_dir() -> str:
+    d = LOCAL_AUDIO_OUT_DIR
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+async def transcribe_api_task(task_id: str, run_id: str) -> None:
+    """Cloud STT — runs in the backend, no fleet SSH involved."""
+    from .cloud_api import transcribe_audio
+
+    async with _new_session() as session:
+        task = await session.get(InferenceTask, task_id)
+        run = await session.get(InferenceRun, run_id)
+        if not task or not run:
+            return
+        _append_log(task, f"Cloud STT via API ({task.nim_id})")
+        task.status = "inferring"
+        task.phase = "cloud transcription"
+        session.add(task)
+        await session.commit()
+        start = _time.monotonic()
+        try:
+            text = await transcribe_audio(run.audio_path, task.nim_id)
+        except Exception as exc:
+            task.status = "failed"
+            task.error = f"cloud STT failed: {exc}"[:500]
+            _append_log(task, f"FAILED: {task.error}")
+            task.wall_ms = int((_time.monotonic() - start) * 1000)
+            session.add(task)
+            await session.commit()
+            return
+        text = _clean_transcript(text)
+        if not text:
+            task.status = "failed"
+            task.error = "empty cloud transcript"
+            _append_log(task, "FAILED: empty transcript")
+        else:
+            task.status = "done"
+            task.transcript = text[:20000]
+            _append_log(task, f"Done in {int((_time.monotonic() - start) * 1000)}ms")
+        task.wall_ms = int((_time.monotonic() - start) * 1000)
+        session.add(task)
+        await session.commit()
+
+
+async def synthesize_api_task(task_id: str, run_id: str) -> None:
+    """Cloud TTS via NVIDIA Riva gRPC — runs in the backend."""
+    from .cloud_api import synthesize_speech_cloud
+
+    async with _new_session() as session:
+        task = await session.get(InferenceTask, task_id)
+        run = await session.get(InferenceRun, run_id)
+        if not task or not run:
+            return
+        _append_log(task, f"Cloud TTS via API ({task.nim_id})")
+        task.status = "inferring"
+        task.phase = "cloud synthesis"
+        session.add(task)
+        await session.commit()
+        start = _time.monotonic()
+        out_path = os.path.join(_output_dir(), f"{run.id}.wav")
+        try:
+            synthesized = await synthesize_speech_cloud(run.text_input or "", out_path)
+            if not os.path.exists(out_path) and os.path.exists(synthesized):
+                out_path = synthesized
+        except Exception as exc:
+            task.status = "failed"
+            task.error = f"cloud TTS failed: {exc}"[:500]
+            _append_log(task, f"FAILED: {task.error}")
+            task.wall_ms = int((_time.monotonic() - start) * 1000)
+            session.add(task)
+            await session.commit()
+            return
+        if not os.path.exists(out_path):
+            task.status = "failed"
+            task.error = "cloud TTS returned no audio"
+            task.wall_ms = int((_time.monotonic() - start) * 1000)
+            session.add(task)
+            await session.commit()
+            return
+        task.status = "done"
+        task.audio_out = out_path
+        task.wall_ms = int((_time.monotonic() - start) * 1000)
+        _append_log(task, f"Done in {task.wall_ms}ms")
+        session.add(task)
+        await session.commit()
+
+
+async def synthesize_task(
+    task_id: str,
+    run_id: str,
+    machine_id: str,
+) -> None:
+    """Local TTS via kokoro-mlx (MLX) on a fleet machine. Pulls WAV back to the backend."""
+    async with _new_session() as session:
+        task = await session.get(InferenceTask, task_id)
+        run = await session.get(InferenceRun, run_id)
+        machine = await session.get(Machine, machine_id)
+        if not task or not run or not machine:
+            return
+
+        task.status = "uploading"
+        _append_log(task, f"Starting TTS on {machine.name} ({machine.host})")
+        session.add(task)
+        await session.commit()
+
+        conn = await POOL.get(machine.host, machine.port, machine.username)
+        out_dir = f"{AUDIO_REMOTE_DIR}/out_{run.id[:8]}"
+        out_file = f"{out_dir}/{run.id}.wav"
+
+        script = (
+            'export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"; '
+            'PY="$HOME/.infervoice/tts-venv/bin/python"; '
+            '[ -x "$PY" ] || { echo "__IV_NO_RUNTIME__"; exit 97; }; '
+            f'rm -rf "{out_dir}"; mkdir -p "{out_dir}"; '
+            f'cat > "{out_dir}/input.txt" <<\'IVEOF\'\n{run.text_input or ""}\nIVEOF\n'
+            f'cd "{out_dir}" && '
+            f'"$PY" - "{out_file}" <<\'PYEOF\'\n'
+            'import sys\n'
+            'import kokoro_mlx\n'
+            'out = sys.argv[1]\n'
+            'tts = kokoro_mlx.KokoroTTS.from_pretrained()\n'
+            'with open("input.txt") as fh:\n'
+            '    text = fh.read()\n'
+            'tts.save(text, out, voice="af_heart")\n'
+            'PYEOF\n'
+            f'[ -f "{out_file}" ] && echo "__IV_AUDIO_OK__" || {{ echo "__IV_AUDIO_MISSING__"; exit 98; }}'
+        )
+
+        task.status = "inferring"
+        task.phase = "running kokoro-mlx"
+        _append_log(task, f"Running TTS: kokoro-mlx ({task.delivery})")
+        session.add(task)
+        await session.commit()
+
+        start = _time.monotonic()
+        exit_status, stdout, stderr, wall_ms = await _run_inference(conn, script, task, start)
+
+        if exit_status == -1:
+            _append_log(task, f"TTS timed out after {INF_TIMEOUT}s")
+            session.add(task)
+            await session.commit()
+            return
+
+        if task.error == "__IV_NO_RUNTIME__" or "__IV_NO_RUNTIME__" in stdout or exit_status == 97:
+            _append_log(task, "TTS runtime not found — auto-installing kokoro-mlx")
+            log.info("TTS runtime missing on %s, auto-installing...", machine.name)
+            task.status = "installing_runtime"
+            task.phase = "installing kokoro-mlx"
+            session.add(task)
+            await session.commit()
+            try:
+                install_result = await install_tts_runtime(machine)
+            except Exception as exc:
+                task.status = "failed"
+                task.error = f"auto-install TTS runtime failed: {exc}"; task.wall_ms = wall_ms
+                session.add(task); await session.commit(); return
+            _append_log(task, f"Install output: {install_result['output'][-500:]}")
+            if not install_result["ok"]:
+                task.status = "failed"
+                task.error = f"TTS runtime auto-install failed: {install_result['output'][-300:]}"
+                task.wall_ms = wall_ms
+                session.add(task); await session.commit(); return
+            _append_log(task, "TTS runtime installed — retrying")
+            task.status = "inferring"; task.phase = "retrying synthesis"
+            session.add(task); await session.commit()
+            start2 = _time.monotonic()
+            exit_status, stdout, stderr, wall_ms = await _run_inference(conn, script, task, start2)
+            if exit_status == -1:
+                _append_log(task, f"Retry timed out after {INF_TIMEOUT}s")
+                session.add(task); await session.commit(); return
+
+        if exit_status != 0:
+            task.status = "failed"
+            task.error = f"TTS failed ({exit_status}): {(stderr or stdout)[-300:]}"
+        elif "__IV_AUDIO_OK__" not in stdout:
+            task.status = "failed"
+            task.error = f"no audio generated. stderr: {stderr[-200:]}"
+        else:
+            local_path = os.path.join(_output_dir(), f"{run.id}.wav")
+            try:
+                await _download_audio(conn, out_file, local_path)
+            except Exception as exc:
+                task.status = "failed"
+                task.error = f"failed to fetch audio: {exc}"[:500]
+                session.add(task); await session.commit(); return
+            task.status = "done"
+            task.audio_out = local_path
+            _append_log(task, f"Done in {wall_ms}ms — audio saved locally")
+
+        task.wall_ms = wall_ms
+        if task.status == "failed":
+            _append_log(task, f"FAILED: {task.error}")
+        session.add(task)
+        await session.commit()
+
+
+async def _resolve_root(session: AsyncSession, machine: Machine) -> str:
+    from .db import get_setting
+    from .downloads import MODELS_ROOT, SETTING_MODELS_ROOT
+
+    if machine.models_root:
+        return machine.models_root
+    global_root = await get_setting(session, SETTING_MODELS_ROOT)
+    return global_root or MODELS_ROOT
+
+
 _background: set[asyncio.Task] = set()
 _runs: dict[str, asyncio.Task] = {}
 _procs: dict[str, object] = {}
+
+
+@dataclass
+class InstallJob:
+    machine_id: str
+    status: str = "queued"  # queued | running | done | failed
+    ok: bool = False
+    logs: list[str] = field(default_factory=list)
+    error: str | None = None
+    started_at: datetime.datetime = field(default_factory=datetime.datetime.now)
+    finished_at: datetime.datetime | None = None
+
+
+_install_jobs: dict[str, InstallJob] = {}
+
+
+def get_install_job(machine_id: str) -> InstallJob | None:
+    return _install_jobs.get(machine_id)
+
+
+def start_install_job(machine: Machine) -> InstallJob:
+    existing = _install_jobs.get(machine.id)
+    if existing and existing.status in ("queued", "running"):
+        return existing
+    job = InstallJob(machine_id=machine.id)
+    _install_jobs[machine.id] = job
+    task = asyncio.create_task(_install_job_worker(machine.id, machine))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
+    return job
+
+
+async def _install_job_worker(machine_id: str, machine: Machine) -> None:
+    job = _install_jobs.get(machine_id)
+    if not job:
+        return
+    job.status = "running"
+    job.started_at = datetime.datetime.now()
+    try:
+        result = await install_asr_runtime(machine, log_cb=lambda line: job.logs.append(line))
+        job.ok = result["ok"]
+        job.status = "done" if result["ok"] else "failed"
+        if not result["ok"]:
+            job.error = result["output"][-500:]
+    except asyncio.CancelledError:
+        job.status = "failed"
+        job.error = "install cancelled"
+        raise
+    except Exception as exc:
+        log.exception("install job %s crashed", machine_id)
+        job.status = "failed"
+        job.error = f"{type(exc).__name__}: {exc}"[:500]
+    finally:
+        job.finished_at = datetime.datetime.now()
+
+
+def install_out(job: InstallJob) -> dict:
+    return {
+        "machine_id": job.machine_id,
+        "status": job.status,
+        "ok": job.ok,
+        "log_text": "\n".join(job.logs)[-16000:],
+        "error": job.error,
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+    }
 
 
 async def orchestrate_run(run_id: str, audio_duration: float | None) -> None:
@@ -396,7 +761,20 @@ async def orchestrate_run(run_id: str, audio_duration: float | None) -> None:
 
     async def one(task_id: str, machine_id: str) -> None:
         try:
-            await transcribe_task(task_id, run_id, machine_id)
+            async with _new_session() as s:
+                t = await s.get(InferenceTask, task_id)
+                ttype = t.task_type if t else "stt"
+                delivery = t.delivery if t else "download"
+            if delivery == "api":
+                if ttype == "tts":
+                    await synthesize_api_task(task_id, run_id)
+                else:
+                    await transcribe_api_task(task_id, run_id)
+            else:
+                if ttype == "tts":
+                    await synthesize_task(task_id, run_id, machine_id)
+                else:
+                    await transcribe_task(task_id, run_id, machine_id)
         except asyncio.CancelledError:
             try:
                 async with _new_session() as s:

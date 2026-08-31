@@ -75,36 +75,50 @@ def _parse_mem(block: str) -> tuple[float, float, float] | None:
     return round(pct, 1), used_gb, total_gb
 
 
-def _parse_net(block: str) -> tuple[int, int]:
-    rx = tx = 0
+def _parse_net(block: str) -> dict[str, tuple[int, int]]:
+    per_iface: dict[str, tuple[int, int]] = {}
     for line in block.splitlines():
         if "<Link#" not in line:
             continue
         fields = line.split()
-        if len(fields) < 10 or not _LINK_RE.match(fields[0]):            continue
+        if len(fields) < 10 or not _LINK_RE.match(fields[0]):
+            continue
         try:
-            rx += int(fields[6])
-            tx += int(fields[9])
+            per_iface[fields[0]] = (int(fields[6]), int(fields[9]))
         except (ValueError, IndexError):
             continue
-    return rx, tx
+    return per_iface
 
 
 class MetricsCache:
     def __init__(self) -> None:
-        self._last: dict[str, tuple[float, int, int]] = {}
+        self._last: dict[str, dict[str, tuple[float, int, int]]] = {}
 
-    def rates(self, machine_id: str, now: float, rx: int, tx: int) -> tuple[float | None, float | None]:
+    def rates(
+        self, machine_id: str, now: float, ifaces: dict[str, tuple[int, int]]
+    ) -> tuple[float | None, float | None]:
         prev = self._last.get(machine_id)
-        self._last[machine_id] = (now, rx, tx)
-        if prev is None:
+        self._last[machine_id] = {name: (now, r, t) for name, (r, t) in ifaces.items()}
+        if not prev or not ifaces:
             return None, None
-        dt = now - prev[0]
-        if dt <= 0 or dt > 10:
+        rx_total = tx_total = 0.0
+        counted = 0
+        for name, (r, t) in ifaces.items():
+            if name not in prev:
+                continue
+            pr, pt = prev[name][1], prev[name][2]
+            dt = now - prev[name][0]
+            if dt <= 0:
+                continue
+            if r < pr or t < pt:
+                continue
+            dt = min(dt, 10.0)
+            rx_total += max(0.0, (r - pr)) / dt / 1024
+            tx_total += max(0.0, (t - pt)) / dt / 1024
+            counted += 1
+        if counted == 0:
             return None, None
-        rx_kbps = max(0.0, (rx - prev[1]) / dt / 1024)
-        tx_kbps = max(0.0, (tx - prev[2]) / dt / 1024)
-        return round(rx_kbps, 1), round(tx_kbps, 1)
+        return round(rx_total, 1), round(tx_total, 1)
 
 
 CACHE = MetricsCache()
@@ -132,7 +146,7 @@ async def sample_metrics(conn: asyncssh.SSHClientConnection, machine_id: str) ->
 
     cpu_pct = _parse_cpu(cpu_block)
     mem_parsed = _parse_mem(mem_block)
-    rx_bytes, tx_bytes = _parse_net(net_block)
+    ifaces = _parse_net(net_block)
 
     errors = []
     if cpu_pct is None:
@@ -144,7 +158,7 @@ async def sample_metrics(conn: asyncssh.SSHClientConnection, machine_id: str) ->
     else:
         mem_pct, mem_used_gb, mem_total_gb = mem_parsed
 
-    rx_kbps, tx_kbps = CACHE.rates(machine_id, time.monotonic(), rx_bytes, tx_bytes)
+    rx_kbps, tx_kbps = CACHE.rates(machine_id, time.monotonic(), ifaces)
 
     if errors:
         log.debug("metric parse gaps for %s: %s", machine_id, errors)

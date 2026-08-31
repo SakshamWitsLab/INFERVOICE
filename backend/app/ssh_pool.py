@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 from dataclasses import dataclass
+from collections.abc import Callable
 
 import asyncssh
 
@@ -169,3 +170,62 @@ async def run_cmd(
         return await asyncio.wait_for(_run(), timeout=timeout or CONFIG.exec_timeout)
     except TimeoutError:
         return None, "", f"command timed out after {timeout or CONFIG.exec_timeout}s"
+
+
+async def run_cmd_live(
+    conn: asyncssh.SSHClientConnection,
+    command: str,
+    timeout: float | None = None,
+    max_output: int | None = None,
+    on_line: Callable[[str], None] | None = None,
+) -> tuple[int | None, str]:
+    """Run a command, streaming stdout+stderr to the on_line callback as lines arrive.
+
+    Returns (exit_status, combined output truncated to max_output bytes).
+    """
+    limit = max_output or CONFIG.max_output_bytes
+
+    async def pump(stream: asyncssh.SSHReader, out: list[str]) -> None:
+        partial = ""
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    stream.read(4096), timeout=timeout or CONFIG.exec_timeout
+                )
+            except (asyncio.TimeoutError, asyncssh.Error, EOFError, OSError):
+                return
+            if not chunk:
+                break
+            partial += chunk
+            while "\n" in partial:
+                line, partial = partial.split("\n", 1)
+                line = line.rstrip("\r")
+                if on_line:
+                    try:
+                        on_line(line)
+                    except Exception:
+                        pass
+                out.append(line)
+        if partial:
+            if on_line:
+                try:
+                    on_line(partial)
+                except Exception:
+                    pass
+            out.append(partial)
+
+    captured: list[str] = []
+    process = await asyncio.wait_for(conn.create_process(command, encoding="utf-8"), timeout=30)
+    out_task = asyncio.create_task(pump(process.stdout, captured))
+    err_task = asyncio.create_task(pump(process.stderr, captured))
+    try:
+        await asyncio.wait_for(process.wait_closed(), timeout=timeout or CONFIG.exec_timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            process.terminate()
+        except Exception:
+            pass
+    await asyncio.gather(out_task, err_task, return_exceptions=True)
+    status = process.exit_status if process.exit_status is not None else -1
+    text = "\n".join(captured)
+    return status, text[-limit:]

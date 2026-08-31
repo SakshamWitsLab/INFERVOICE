@@ -253,6 +253,8 @@ async def deployments(
     entries = []
     for (machine_id, nim_id), job in latest.items():
         machine = await session.get(Machine, machine_id)
+        if machine is None:
+            continue
         entries.append(
             {
                 "machine_id": machine_id,

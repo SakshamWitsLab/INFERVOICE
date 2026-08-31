@@ -23,6 +23,7 @@ import {
 } from "lucide-react";
 import {
   api,
+  audioOutUrl,
   fmtGB,
   type Deployment,
   type InferenceRunDetail,
@@ -36,11 +37,15 @@ import { colorForMachine } from "@/lib/colors";
 const FAMILY_GRADIENTS: Record<string, string> = {
   Parakeet: "from-violet-600/40 to-fuchsia-600/20",
   Canary: "from-amber-500/40 to-orange-600/20",
+  Kokoro: "from-rose-600/40 to-pink-600/20",
   Riva: "from-sky-500/40 to-cyan-600/20",
   Speech: "from-emerald-500/40 to-teal-600/20",
+  TTS: "from-fuchsia-600/40 to-purple-600/20",
 };
 
 export default function PlaygroundPage() {
+  const [task, setTask] = useState<"stt" | "tts">("stt");
+
   const { data: catalogRes } = usePoll(() => api.inferenceCatalog(), 60000);
   const runnableModels = useMemo(
     () => (catalogRes?.models ?? []).filter((m) => m.runnable && m.downloadable),
@@ -60,14 +65,32 @@ export default function PlaygroundPage() {
     return map;
   }, [deployments]);
 
-  const runnableWithDeployments = useMemo(
-    () => runnableModels.filter((m) => (deployedByModel.get(m.nim_id) ?? []).length > 0),
-    [runnableModels, deployedByModel]
+  // A model is available locally if it is runnable AND deployed somewhere.
+  const localByModel = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of runnableModels) {
+      if ((deployedByModel.get(m.nim_id) ?? []).length > 0) set.add(m.nim_id);
+    }
+    return set;
+  }, [runnableModels, deployedByModel]);
+
+  const taskModels = useMemo(() => {
+    const all = catalogRes?.models ?? [];
+    return all.filter((m) => (m.task ?? "stt") === task);
+  }, [catalogRes, task]);
+
+  // Every model selectable for the current task: either local-capable or API-capable.
+  const targetModels = useMemo(
+    () => taskModels.filter((m) => localByModel.has(m.nim_id) || m.api_supported),
+    [taskModels, localByModel]
   );
 
   const [selectedTargets, setSelectedTargets] = useState<Map<string, Set<string>>>(new Map());
+  const [cloudTargets, setCloudTargets] = useState<Set<string>>(new Set());
+  const [textInput, setTextInput] = useState("");
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
+  const [audioFileName, setAudioFileName] = useState<string>("");
   const [duration, setDuration] = useState(0);
 
   const [runId, setRunId] = useState<string | null>(null);
@@ -90,12 +113,14 @@ export default function PlaygroundPage() {
   function pickFile(f: File | null) {
     if (!f) return;
     setAudioFile(f);
+    setAudioFileName(f.name.replace(/\.[^.]+$/, ""));
     setDuration(0);
     if (audioUrl) URL.revokeObjectURL(audioUrl);
     setAudioUrl(URL.createObjectURL(f));
   }
 
-  function toggleModel(nimId: string) {
+  function toggleLocal(nimId: string) {
+    // Selecting/managing the local (download) delivery for a model.
     setSelectedTargets((prev) => {
       const next = new Map(prev);
       const machines = deployedByModel.get(nimId) ?? [];
@@ -104,6 +129,15 @@ export default function PlaygroundPage() {
       } else {
         next.set(nimId, new Set(machines.map((d) => d.machine_id)));
       }
+      return next;
+    });
+  }
+
+  function toggleCloud(nimId: string) {
+    setCloudTargets((prev) => {
+      const next = new Set(prev);
+      if (next.has(nimId)) next.delete(nimId);
+      else next.add(nimId);
       return next;
     });
   }
@@ -123,30 +157,73 @@ export default function PlaygroundPage() {
   const totalTargets = useMemo(() => {
     let n = 0;
     for (const ids of selectedTargets.values()) n += ids.size;
+    n += cloudTargets.size;
     return n;
-  }, [selectedTargets]);
+  }, [selectedTargets, cloudTargets]);
 
   async function start() {
-    if (!audioFile || selectedTargets.size === 0) return;
-    setBusy(true);    setError(null);
+    if (task === "stt") {
+      if (!audioFile) return;
+      setBusy(true);
+      setError(null);
+      try {
+        const probe = new Audio();
+        const dur = await new Promise<number>((resolve) => {
+          probe.preload = "metadata";
+          probe.onloadedmetadata = () => resolve(probe.duration || duration || 0);
+          probe.onerror = () => resolve(duration || 0);
+          probe.src = audioUrl!;
+        });
+        const targets = buildTargets();
+        const name = audioFileName.trim() || audioFile.name;
+        const res = await api.createMultiRun(audioFile, targets, dur, name);
+        setRunId(res.run_id);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+      setBusy(false);
+      return;
+    }
+
+    // TTS
+    if (!textInput.trim()) return;
+    setBusy(true);
+    setError(null);
     try {
-      const probe = new Audio();
-      const dur = await new Promise<number>((resolve) => {
-        probe.preload = "metadata";
-        probe.onloadedmetadata = () => resolve(probe.duration || duration || 0);
-        probe.onerror = () => resolve(duration || 0);
-        probe.src = audioUrl!;
-      });
-      const targets = [...selectedTargets.entries()].map(([model_id, machine_ids]) => ({
-        model_id,
-        machine_ids: [...machine_ids],
-      }));
-      const res = await api.createMultiRun(audioFile, targets, dur);
+      const targets = buildTargets();
+      const res = await api.createTtsRun(
+        textInput,
+        targets,
+        "download",
+        audioFileName.trim() || ""
+      );
       setRunId(res.run_id);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
     setBusy(false);
+  }
+
+  function buildTargets(): {
+    model_id: string;
+    machine_ids: string[];
+    delivery: "download" | "api";
+    task_type: "stt" | "tts";
+  }[] {
+    const out: { model_id: string; machine_ids: string[]; delivery: "download" | "api"; task_type: "stt" | "tts" }[] = [];
+    for (const [model_id, machine_ids] of selectedTargets.entries()) {
+      if (machine_ids.size === 0) continue;
+      out.push({
+        model_id,
+        machine_ids: [...machine_ids],
+        delivery: "download",
+        task_type: task,
+      });
+    }
+    for (const model_id of cloudTargets) {
+      out.push({ model_id, machine_ids: [], delivery: "api", task_type: task });
+    }
+    return out;
   }
 
   async function stopRun() {
@@ -184,35 +261,99 @@ export default function PlaygroundPage() {
 
       <div className="mt-8 grid gap-6 lg:grid-cols-[1fr_340px]">
         <section className="rounded-xl border border-white/10 bg-white/[0.03] p-5">
-          <h2 className="flex items-center gap-2 text-sm font-medium">
-            <Radio className="h-4 w-4 text-violet-300" /> Audio source
-          </h2>
-          <div className="mt-4 grid gap-4 sm:grid-cols-2">
-            <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-black/20 p-3">
-              <span className="text-xs font-medium text-zinc-400">Record live</span>
-              <AudioRecorder onRecorded={pickFile} />
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h2 className="flex items-center gap-2 text-sm font-medium">
+              <Radio className="h-4 w-4 text-violet-300" /> Task
+            </h2>
+            <div className="inline-flex overflow-hidden rounded-lg border border-white/10">
+              <button
+                onClick={() => { setTask("stt"); setSelectedTargets(new Map()); setCloudTargets(new Set()); }}
+                className={`px-3 py-1.5 text-xs font-semibold ${
+                  task === "stt" ? "bg-violet-600 text-white" : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                STT
+              </button>
+              <button
+                onClick={() => { setTask("tts"); setSelectedTargets(new Map()); setCloudTargets(new Set()); }}
+                className={`px-3 py-1.5 text-xs font-semibold ${
+                  task === "tts" ? "bg-fuchsia-600 text-white" : "text-zinc-400 hover:text-zinc-200"
+                }`}
+              >
+                TTS
+              </button>
             </div>
-            <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-white/15 bg-black/20 p-3 text-center hover:border-violet-400/40">
-              <Upload className="h-5 w-5 text-zinc-500" />
-              <span className="text-xs text-zinc-400">Drop / choose a file</span>
-              <span className="text-[10px] text-zinc-600">wav · mp3 · flac · m4a</span>
-              <input
-                type="file"
-                accept="audio/*"
-                className="hidden"
-                onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
-              />
-            </label>
           </div>
 
-          {audioFile && (
-            <div className="mt-4 flex flex-wrap items-center gap-3 rounded-lg border border-emerald-400/20 bg-emerald-400/5 px-3 py-2">
-              <FileAudio className="h-4 w-4 text-emerald-300" />
-              <span className="truncate text-xs text-zinc-200">{audioFile.name}</span>
-              <span className="text-[11px] text-zinc-500">{(audioFile.size / 1024).toFixed(0)} KB</span>
-              {audioUrl && (
-                <audio controls src={audioUrl} className="ml-auto h-8 max-w-full" />
+          {task === "stt" ? (
+            <>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <div className="flex flex-col gap-2 rounded-lg border border-white/10 bg-black/20 p-3">
+                  <span className="text-xs font-medium text-zinc-400">Record live</span>
+                  <AudioRecorder onRecorded={pickFile} />
+                </div>
+                <label className="flex cursor-pointer flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-white/15 bg-black/20 p-3 text-center hover:border-violet-400/40">
+                  <Upload className="h-5 w-5 text-zinc-500" />
+                  <span className="text-xs text-zinc-400">Drop / choose a file</span>
+                  <span className="text-[10px] text-zinc-600">wav · mp3 · flac · m4a</span>
+                  <input
+                    type="file"
+                    accept="audio/*"
+                    className="hidden"
+                    onChange={(e) => pickFile(e.target.files?.[0] ?? null)}
+                  />
+                </label>
+              </div>
+
+              {audioFile && (
+                <div className="mt-4 rounded-lg border border-emerald-400/20 bg-emerald-400/5 px-3 py-2.5">
+                  <div className="flex items-center gap-2">
+                    <FileAudio className="h-4 w-4 shrink-0 text-emerald-300" />
+                    <span className="text-[10px] uppercase tracking-wide text-zinc-500">audio file</span>
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={audioFileName}
+                      onChange={(e) => setAudioFileName(e.target.value)}
+                      placeholder="recording name"
+                      className="flex-1 rounded border border-white/10 bg-black/20 px-2 py-1 font-mono text-xs text-zinc-200 placeholder-zinc-600 focus:border-violet-400/50 focus:outline-none"
+                    />
+                    <span className="text-[11px] text-zinc-500">
+                      {audioFile.name.split(".").pop()?.toUpperCase()} · {(audioFile.size / 1024).toFixed(0)} KB
+                    </span>
+                  </div>
+                  {audioUrl && (
+                    <audio controls src={audioUrl} className="mt-2 h-8 w-full" />
+                  )}
+                </div>
               )}
+            </>
+          ) : (
+            <div className="mt-4 rounded-lg border border-fuchsia-400/20 bg-fuchsia-400/5 px-3 py-2.5">
+              <div className="flex items-center gap-2">
+                <AudioLines className="h-4 w-4 shrink-0 text-fuchsia-300" />
+                <span className="text-[10px] uppercase tracking-wide text-zinc-500">text to speak</span>
+              </div>
+              <textarea
+                value={textInput}
+                onChange={(e) => setTextInput(e.target.value)}
+                placeholder="Type some text to synthesize…"
+                rows={5}
+                className="mt-2 w-full resize-y rounded border border-white/10 bg-black/20 px-3 py-2 font-mono text-xs text-zinc-200 placeholder-zinc-600 focus:border-violet-400/50 focus:outline-none"
+              />
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <input
+                  type="text"
+                  value={audioFileName}
+                  onChange={(e) => setAudioFileName(e.target.value)}
+                  placeholder="output name"
+                  className="flex-1 min-w-32 rounded border border-white/10 bg-black/20 px-2 py-1 font-mono text-xs text-zinc-200 placeholder-zinc-600 focus:border-fuchsia-400/50 focus:outline-none"
+                />
+                <span className="text-[10px] text-zinc-500">
+                  choose Local and/or Cloud per model below
+                </span>
+              </div>
             </div>
           )}
         </section>
@@ -223,42 +364,76 @@ export default function PlaygroundPage() {
           </h2>
 
           <div className="mt-4 space-y-2">
-            {runnableWithDeployments.length === 0 ? (
+            {targetModels.length === 0 ? (
               <p className="text-xs text-zinc-500">
-                No deployed models yet — deploy from the{" "}
-                <Link href="/models" className="text-violet-300">Models tab</Link> first.
+                No {task === "stt" ? "STT" : "TTS"} models available.{" "}
+                <Link href="/models" className="text-violet-300">Deploy local models</Link>{" "}
+                or add an NVIDIA API key to unlock cloud models.
               </p>
             ) : (
-              runnableWithDeployments.map((m) => {
+              targetModels.map((m) => {
                 const deps = deployedByModel.get(m.nim_id) ?? [];
-                const isSelected = selectedTargets.has(m.nim_id);
+                const hasLocal = localByModel.has(m.nim_id);
+                const hasCloud = !!m.api_supported;
+                const localSelected = selectedTargets.has(m.nim_id);
+                const cloudSelected = cloudTargets.has(m.nim_id);
                 const selectedMachines = selectedTargets.get(m.nim_id) ?? new Set();
                 return (
-                  <div key={m.nim_id}>
-                    <button
-                      onClick={() => toggleModel(m.nim_id)}
-                      className={`w-full rounded-lg border p-3 text-left transition-all ${
-                        isSelected
-                          ? "border-violet-400/50 bg-violet-400/10"
-                          : "border-white/10 bg-white/[0.02] hover:border-white/25"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2">
-                        <div className="flex items-center gap-2">
-                          <div
-                            className={`h-2 w-2 rounded-full bg-gradient-to-br ${
-                              FAMILY_GRADIENTS[m.family] ?? "from-zinc-400 to-zinc-600"
-                            }`}
-                          />
-                          <span className="font-mono text-xs font-medium">{m.nim_id}</span>
-                        </div>
-                        <span className="text-[10px] text-zinc-500">
-                          {m.size_gb != null ? `${m.size_gb} GB` : ""}
-                        </span>
+                  <div
+                    key={m.nim_id}
+                    className={`rounded-lg border p-3 transition-all ${
+                      localSelected || cloudSelected
+                        ? "border-violet-400/50 bg-violet-400/10"
+                        : "border-white/10 bg-white/[0.02]"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div
+                          className={`h-2 w-2 shrink-0 rounded-full bg-gradient-to-br ${
+                            FAMILY_GRADIENTS[m.family] ?? "from-zinc-400 to-zinc-600"
+                          }`}
+                        />
+                        <span className="truncate font-mono text-xs font-medium">{m.nim_id}</span>
                       </div>
-                    </button>
-                    {isSelected && (
-                      <div className="mt-1 flex flex-wrap gap-1 pl-3">
+                      <span className="shrink-0 text-[10px] text-zinc-500">
+                        {m.size_gb != null ? `${m.size_gb} GB` : m.api_supported ? "cloud" : ""}
+                      </span>
+                    </div>
+                    <div className="mt-2.5 flex flex-wrap items-center gap-1.5">
+                      {hasLocal && (
+                        <span
+                          onClick={() => toggleLocal(m.nim_id)}
+                          className={`inline-flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] transition-colors ${
+                            localSelected
+                              ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+                              : "border-white/15 text-zinc-500 hover:border-white/30"
+                          }`}
+                        >
+                          Local
+                          {localSelected ? (
+                            <CheckCircle2 className="h-3 w-3" />
+                          ) : (
+                            <span className="h-1.5 w-1.5 rounded-full bg-emerald-400/50" />
+                          )}
+                        </span>
+                      )}
+                      {hasCloud && (
+                        <span
+                          onClick={() => toggleCloud(m.nim_id)}
+                          className={`inline-flex cursor-pointer items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] transition-colors ${
+                            cloudSelected
+                              ? "border-sky-400/40 bg-sky-400/10 text-sky-300"
+                              : "border-white/15 text-zinc-500 hover:border-white/30"
+                          }`}
+                        >
+                          ☁ API
+                          {cloudSelected && <CheckCircle2 className="h-3 w-3" />}
+                        </span>
+                      )}
+                    </div>
+                    {localSelected && (
+                      <div className="mt-2 flex flex-wrap gap-1 border-t border-white/5 pt-2">
                         {deps.map((d) => (
                           <label
                             key={d.machine_id}
@@ -296,11 +471,16 @@ export default function PlaygroundPage() {
 
           <button
             onClick={start}
-            disabled={busy || !audioFile || totalTargets === 0 || running}
+            disabled={
+              busy ||
+              (task === "stt" ? !audioFile : !textInput.trim()) ||
+              totalTargets === 0 ||
+              running
+            }
             className="mt-5 inline-flex w-full items-center justify-center gap-2 rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-semibold hover:bg-violet-500 disabled:opacity-40"
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-            Run parallel inference ({totalTargets})
+            {task === "stt" ? "Run parallel inference" : "Synthesize speech"} ({totalTargets})
           </button>
         </section>
       </div>
@@ -378,7 +558,7 @@ export default function PlaygroundPage() {
                   {t.status === "installing_runtime" && (
                     <div className="mt-3 flex items-center gap-2 rounded-lg border border-amber-400/20 bg-amber-400/10 px-3 py-2 text-[11px] text-amber-200">
                       <Loader2 className="h-3 w-3 animate-spin" />
-                      Installing ASR runtime on {t.machine_name}…
+                      Installing {t.task_type === "tts" ? "TTS" : "ASR"} runtime on {t.machine_name}…
                     </div>
                   )}
                   {t.phase && !t.transcript && t.status !== "failed" && (
@@ -396,6 +576,24 @@ export default function PlaygroundPage() {
                         <Copy className="h-3 w-3" /> copy
                       </button>
                     </>
+                  )}
+                  {t.audio_out && (
+                    <div className="mt-3 rounded-lg border border-fuchsia-400/20 bg-fuchsia-400/5 px-3 py-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="flex items-center gap-1.5 text-[10px] uppercase tracking-wide text-zinc-500">
+                          <AudioLines className="h-3 w-3 text-fuchsia-300" /> generated audio
+                        </span>
+                        <a
+                          href={audioOutUrl(t.id)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex items-center gap-1 text-[11px] text-fuchsia-300 hover:text-fuchsia-200"
+                        >
+                          <Download className="h-3 w-3" /> save
+                        </a>
+                      </div>
+                      <audio controls src={audioOutUrl(t.id)} className="mt-2 h-8 w-full" />
+                    </div>
                   )}
                   {t.log_text && (
                     <details className="group mt-3 rounded-lg border border-white/10 bg-black/25">

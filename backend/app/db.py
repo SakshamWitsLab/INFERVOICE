@@ -29,6 +29,12 @@ async def init_db() -> None:
             "ALTER TABLE inferencetask ADD COLUMN progress_pct FLOAT",
             "ALTER TABLE inferencetask ADD COLUMN phase VARCHAR",
             "ALTER TABLE inferencetask ADD COLUMN log_text VARCHAR",
+            "ALTER TABLE inferencerun ADD COLUMN task_type VARCHAR",
+            "ALTER TABLE inferencerun ADD COLUMN delivery VARCHAR",
+            "ALTER TABLE inferencerun ADD COLUMN text_input TEXT",
+            "ALTER TABLE inferencetask ADD COLUMN task_type VARCHAR",
+            "ALTER TABLE inferencetask ADD COLUMN delivery VARCHAR",
+            "ALTER TABLE inferencetask ADD COLUMN audio_out TEXT",
         ):
             try:
                 await conn.execute(text(stmt))
